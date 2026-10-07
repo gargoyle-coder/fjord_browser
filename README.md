@@ -6,17 +6,6 @@ A small, dark browser I built in Python. It runs on PyQt6 and QtWebEngine, so pa
 
 I wanted a browser that stays out of the way, looks calm, and doesn't eat all my RAM. It's one file, `fjord.py`.
 
-## Running it
-
-You need Python 3 and two packages:
-
-```
-pip install PyQt6 PyQt6-WebEngine
-python fjord.py
-```
-
-You can also pass URLs: `python fjord.py example.com another.com`
-
 ## What's in it
 
 **Tabs**
