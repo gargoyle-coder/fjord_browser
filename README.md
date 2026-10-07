@@ -1,10 +1,22 @@
 # Fjord
 <img width="1912" height="1199" alt="image" src="https://github.com/user-attachments/assets/70846741-ff09-4de3-b6ba-29c8cb2e90be" />
 
-
 A small, dark browser I built in Python. It runs on PyQt6 and QtWebEngine, so pages are rendered by Chromium, but everything around the page (tabs, sidebar, start page, settings) is my own.
 
 I wanted a browser that stays out of the way, looks calm, and doesn't eat all my RAM. It's one file, `fjord.py`.
+
+## Running it
+
+You need Python 3 and two packages:
+
+```
+pip install PyQt6 PyQt6-WebEngine
+python fjord.py
+```
+
+For extensions you need PyQt6 6.10 or newer. Older versions still run Fjord, just without extension support.
+
+You can also pass URLs: `python fjord.py example.com another.com`
 
 ## What's in it
 
@@ -19,6 +31,14 @@ I wanted a browser that stays out of the way, looks calm, and doesn't eat all my
 Fjord has its own filter engine that reads uBlock Origin / EasyList style lists (uBlock filters, EasyList, EasyPrivacy, a malware list and a few others). It's on by default. You can pause it per site, and update the lists from settings.
 
 It can't run uBlock's scriptlet rules, so it won't catch everything uBlock Origin does. It handles the bulk of it, and YouTube gets some extra handling.
+
+**Extensions** (new in 0.2.0)
+Fjord runs Chrome extensions as they are, and converts Firefox add-ons and Safari web extensions when you add them. Click the puzzle piece in the toolbar, then paste a Chrome Web Store or Firefox Add-ons link, or pick a `.crx`, `.xpi`, `.zip` or an unpacked folder. You'll see what the extension can access before it installs.
+
+Some Firefox and Safari extensions use features Chromium doesn't have, so don't expect every single one to work. Extensions that talk to apps on your computer (native messaging) aren't supported.
+
+**Toolbar** (new in 0.2.0)
+Right-click the toolbar and pick Customize. Drag buttons to rearrange them, drag them off to remove them, and add separators or spaces. Reset puts it all back. The address bar and menu button always stay.
 
 **Sidebar extras**
 - A media player that shows up when a page is playing audio or video. It has a seek bar, a visualizer, and it picks up colours from the album art.
@@ -89,6 +109,6 @@ The exe ends up in `dist\fjord.exe`. If the one-file build is slow to start or w
 ## Known rough edges
 
 - It's built and tested mostly on Windows. Linux and macOS should work but get less attention.
-- No extensions. The ad blocker is built in and that's the only add-on.
+- Firefox and Safari extensions are converted on the fly, so a few won't work properly.
 - No sync between devices.
 - Fjord is a hobby project. It's built on Chromium so it gets what QtWebEngine gets, but don't count on it for anything high-stakes.
