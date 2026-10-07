@@ -2,7 +2,7 @@
 """
 Fjord Browser - a minimalist, dark, Nordic-inspired browser.
 
-Install:  pip install PyQt6 PyQt6-WebEngine
+Install:  pip install PyQt6 PyQt6-WebEngine   (version 6.10 or newer if you want browser extensions)
 Run:      python fjord.py [url ...]
 
 Ctrl+T new tab · Ctrl+Shift+T reopen closed · Ctrl+W close · Ctrl+L address
@@ -12,24 +12,31 @@ Ctrl+= / - / 0 zoom · Alt+←/→ back/forward · F11 fullscreen · ⋯ menu fo
 Drag the sidebar's right edge to resize it (double-click resets) · right-click the media player for options
 Scratchpad (Ctrl+Shift+S): drop images, files, text or links on the sidebar to keep a copy, then copy or save them again
 Sticky notes: click the little note button at the bottom right of any site to pin a note there (saved in ~/.fjord_browser/notes.json)
+Extensions: the puzzle-piece button in the toolbar (or the ⋯ menu > Extensions) adds Chrome, Firefox and Safari extensions
+Toolbar: right-click it (or ⋯ menu > Customize toolbar…), then drag buttons to rearrange, remove or add them
 """
 import base64
 import colorsys
 import datetime
 import gc
 import html
+import io
 import ipaddress
 import json
 import math
 import mimetypes
 import os
+import posixpath
 import re
 import secrets
 import shutil
+import struct
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, quote_plus, unquote, urlparse
@@ -78,6 +85,10 @@ from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkReques
 from PyQt6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile, QWebEngineScript, QWebEngineSettings,
                                    QWebEngineUrlRequestInfo, QWebEngineUrlRequestInterceptor)
 from PyQt6.QtWebEngineWidgets import QWebEngineView
+try:
+    from PyQt6.QtWebEngineCore import QWebEngineExtensionManager
+except Exception:  # extension support arrived in Qt WebEngine 6.10; older versions run Fjord without it
+    QWebEngineExtensionManager = None
 try:
     from PyQt6.QtSvg import QSvgRenderer
 except Exception:  # QtSvg missing: fall back to downloaded logos / letter badges
@@ -713,6 +724,9 @@ def settings_html(b):
            + "<div class=hint>A browser cannot create a VPN on its own. Point this at a proxy from a VPN or privacy service, "
              "or at Tor (install it and start it first). Chromium cannot do SOCKS5 logins, so use an HTTP proxy for services "
              "that need a username. The password is saved in plain text in settings.json.</div></form></div>")
+    n_ext = len(b.extensions.records)
+    ext_sec = ('<h2>Extensions</h2><div class=card><div class=row><div>Chrome, Firefox and Safari extensions<small>%s</small></div>'
+               '<a class=x href="fjord://ext-open">Manage</a></div></div>' % (e("%d installed" % n_ext) if n_ext else "None installed yet"))
     gc = b.greeting_conf()
     gmode = gc.get("mode") if gc.get("mode") in ("default", "custom", "quote") else "default"
     greet_rows = ('<div class=row><div>Text above the search bar<small>Keep the default, write your own, or show a quote</small></div>'
@@ -780,7 +794,7 @@ def settings_html(b):
             + sw("visualizer", "Media visualiser", "Show animated audio bars in the sidebar media player")
             + "</div><h2>Window</h2><div class=card>" + win_row + "</div><h2>Essentials</h2><div class=card>"
             + sw("ess_startup", "Keep Essentials loaded", "Open your Essentials in the background at startup so they are always ready", True)
-            + ess + "</div>" + privacy + vpn + "<h2>Search</h2><div class=card>" + engine_row
+            + ess + "</div>" + privacy + vpn + ext_sec + "<h2>Search</h2><div class=card>" + engine_row
             + "</div>" + greet_sec + bg_sec + "<h2>Font</h2><div class=card><div class=chips>" + "".join(chip(n) for n in installed_fonts())
             + "</div><div class=hint>Want more? Drop .ttf or .otf files into <b>" + e(str(DATA_DIR / "fonts"))
             + "</b> and restart Fjord.</div></div></main>")
@@ -804,6 +818,13 @@ QToolButton#miniclose { font-size: 8px; padding: 0; background: rgba(255,255,255
 QPushButton#newtab { background: rgba(79,176,232,0.16); border: none; border-radius: 14px;
                      padding: 10px; color: #c5e6fa; }
 QPushButton#newtab:hover { background: rgba(79,176,232,0.28); }
+QFrame#tbpanel { background: #101b26; border-radius: 16px; }
+QLabel#tbtitle { font-size: 13px; font-weight: 600; color: #e4edf3; }
+QLabel#tbhint { color: #8ea3b4; }
+QPushButton#tbdone { background: rgba(79,176,232,0.22); border: none; border-radius: 12px; padding: 7px 18px; color: #c5e6fa; }
+QPushButton#tbdone:hover { background: rgba(79,176,232,0.34); }
+QPushButton#tbreset { background: transparent; border: none; border-radius: 12px; padding: 7px 14px; color: #8ea3b4; }
+QPushButton#tbreset:hover { background: rgba(255,255,255,0.06); color: #e4edf3; }
 QLineEdit { background: #172431; border: 1px solid transparent; border-radius: 16px;
             padding: 8px 16px; selection-background-color: #4fb0e8; }
 QLineEdit:focus { border: 1px solid rgba(79,176,232,0.7); background: #1c2b3a; }
@@ -1716,6 +1737,799 @@ if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",
 })();"""
 
 
+# ---------- browser extensions: Chrome, Firefox and Safari ----------
+# Fjord runs on Chromium, so Chrome extensions load as they are. Firefox add-ons (.xpi) and Safari Web Extensions use the
+# same WebExtensions format. They are unpacked into ~/.fjord_browser/extensions and adjusted a little (adapt_manifest) so
+# Chromium accepts them, and a small script gives them Firefox's promise-based `browser.*` API. Qt only gained extension
+# loading in WebEngine 6.10, so everything that touches Qt is feature-checked and Fjord still runs without it.
+EXT_DIR = DATA_DIR / "extensions"
+EXT_SHIM = "fjord-webext-shim.js"
+EXT_MAX_BYTES = 400 * 1024 * 1024
+EXT_KINDS = {"chrome": "Chrome", "firefox": "Firefox", "safari": "Safari"}
+EXT_FIREFOX_KEYS = ("browser_specific_settings", "applications", "sidebar_action", "chrome_settings_overrides",
+                    "protocol_handlers", "theme_experiment", "user_scripts", "dictionaries", "langpack_id", "experiment_apis")
+EXT_FIREFOX_PERMS = {"contextualIdentities", "browserSettings", "captivePortal", "dns", "find", "geckoProfiler",
+                     "menus.overrideContext", "theme", "telemetry", "trialML", "activityLog", "pkcs11",
+                     "webRequestFilterResponse", "webRequestFilterResponse.serviceWorkerScript"}
+EXT_HOST_RE = re.compile(r"^(<all_urls>|(\*|https?|wss?|ftp|file)://)")
+EXT_ALL_SITES_RE = re.compile(r"^(<all_urls>|(\*|https?|wss?|ftp)://\*/.*)$")
+EXT_PERM_TEXT = {
+    "tabs": "See the address and title of your open tabs",
+    "history": "Read and change your browsing history",
+    "bookmarks": "Read and change your bookmarks",
+    "cookies": "Read and change cookies",
+    "downloads": "Start and manage downloads",
+    "clipboardRead": "Read what you copied",
+    "clipboardWrite": "Change what you copied",
+    "webRequest": "See the network requests pages make",
+    "webRequestBlocking": "Block or change network requests",
+    "declarativeNetRequest": "Block network requests",
+    "nativeMessaging": "Talk to apps on your computer (not supported in Fjord)",
+    "management": "See and manage your other extensions",
+    "privacy": "Change privacy settings",
+    "proxy": "Control proxy settings",
+    "geolocation": "Know your location",
+    "notifications": "Show notifications",
+    "scripting": "Run scripts on pages it can access",
+    "topSites": "See your most visited sites",
+    "sessions": "See your recently closed tabs",
+    "browsingData": "Clear your browsing data",
+}
+
+# Gives Firefox-style code a `browser` object. In Manifest V2 it also turns callback APIs into promises (what Firefox does
+# natively); in Manifest V3 Chromium already returns promises, so it only adds the alias. Always lets a runtime.onMessage
+# listener answer by returning a promise, as Firefox allows.
+EXT_SHIM_JS = r"""(function(g){
+var c=g.chrome;
+if(!c||!c.runtime||g.__fjShim)return;
+try{Object.defineProperty(g,"__fjShim",{value:1});}catch(e){}
+var mv=2;try{mv=c.runtime.getManifest().manifest_version||2;}catch(e){}
+var SYNC={"runtime.getURL":1,"runtime.getManifest":1,"runtime.connect":1,"runtime.connectNative":1,"runtime.reload":1,
+"extension.getURL":1,"extension.getViews":1,"extension.getBackgroundPage":1,"i18n.getMessage":1,"i18n.getUILanguage":1,
+"tabs.connect":1,"contextMenus.create":1,"menus.create":1,"alarms.create":1,"identity.getRedirectURL":1};
+var ALIAS={menus:"contextMenus",browserAction:"action",action:"browserAction"};
+var wraps={},evts={};
+function evt(ev,path){
+  if(path!=="runtime.onMessage")return ev;
+  if(evts[path])return evts[path];
+  var map=new WeakMap();
+  return evts[path]=new Proxy(ev,{get:function(t,k){
+    if(k==="addListener")return function(fn){
+      var w=function(m,s,send){var r=fn(m,s,send);
+        if(r&&typeof r.then==="function"){r.then(function(v){send(v);},function(){send();});return true;}
+        return r;};
+      map.set(fn,w);return t.addListener.apply(t,[w].concat([].slice.call(arguments,1)));};
+    if(k==="removeListener")return function(fn){return t.removeListener(map.get(fn)||fn);};
+    if(k==="hasListener")return function(fn){return t.hasListener(map.get(fn)||fn);};
+    var v=t[k];return typeof v==="function"?v.bind(t):v;}});
+}
+function wrap(obj,path){
+  if(wraps[path])return wraps[path];
+  return wraps[path]=new Proxy(obj,{get:function(t,k){
+    if(typeof k!=="string")return t[k];
+    var v=t[k];
+    if(v===undefined&&!path&&ALIAS[k]&&t[ALIAS[k]]!==undefined)v=t[ALIAS[k]];
+    var p=path?path+"."+k:k;
+    if(typeof v==="function"){
+      if(mv>=3||SYNC[p])return v.bind(t);
+      return function(){var a=[].slice.call(arguments);
+        if(typeof a[a.length-1]==="function")return v.apply(t,a);
+        return new Promise(function(res,rej){
+          a.push(function(r){var e=c.runtime.lastError;if(e)rej(new Error(e.message));else res(r);});
+          try{v.apply(t,a);}catch(x){rej(x);}});};
+    }
+    if(v&&typeof v==="object"&&!Array.isArray(v)){
+      if(typeof v.addListener==="function")return evt(v,p);
+      return wrap(v,p);
+    }
+    return v;}});
+}
+if(typeof g.browser==="undefined")g.browser=wrap(c,"");
+})(typeof globalThis!=="undefined"?globalThis:self);
+"""
+
+
+class ExtError(Exception):
+    """A problem with an extension file, worded so it can be shown to the person as it is."""
+
+
+def _strip_json_comments(s):
+    """Chrome and Firefox both accept // and /* */ comments in manifest.json, which json.loads does not."""
+    out, i, n, in_str = [], 0, len(s), False
+    while i < n:
+        ch = s[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(s[i + 1])
+                i += 1
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+            out.append(ch)
+        elif s.startswith("//", i):
+            while i < n and s[i] != "\n":
+                i += 1
+            continue
+        elif s.startswith("/*", i):
+            j = s.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def load_manifest(path):
+    text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+    try:
+        m = json.loads(text)
+    except ValueError:
+        m = json.loads(_strip_json_comments(text))
+    if not isinstance(m, dict):
+        raise ValueError("manifest is not an object")
+    return m
+
+
+def ext_label(root, m):
+    """The extension's name, looking it up in _locales when the manifest only holds a __MSG_name__ placeholder."""
+    name = str(m.get("name") or "Extension")
+    mt = re.fullmatch(r"__MSG_(.+)__", name)
+    if not mt:
+        return name
+    for loc in (m.get("default_locale"), "en", "en_US", "en_GB"):
+        if not loc:
+            continue
+        try:
+            msgs = load_manifest(Path(root) / "_locales" / str(loc) / "messages.json")
+        except Exception:
+            continue
+        for k, v in msgs.items():
+            if k.lower() == mt.group(1).lower() and isinstance(v, dict) and v.get("message"):
+                return str(v["message"])
+    return mt.group(1)
+
+
+def _rel(p):
+    """A path from a manifest as a clean relative posix path, or "" when it would leave the extension folder."""
+    if not isinstance(p, str) or not p.strip():
+        return ""
+    r = posixpath.normpath(p.strip().lstrip("/"))
+    return "" if r.startswith("..") or r == "." else r
+
+
+def safe_extract(zf, dest):
+    dest = Path(dest).resolve()
+    infos = zf.infolist()
+    if len(infos) > 30000:
+        raise ExtError("That archive has too many files to be an extension.")
+    total = 0
+    for zi in infos:
+        total += zi.file_size
+        if total > EXT_MAX_BYTES:
+            raise ExtError("That archive is too large to be an extension.")
+        target = (dest / zi.filename).resolve()
+        if target != dest and dest not in target.parents:
+            raise ExtError("That archive contains an unsafe file path, so Fjord won't open it.")
+    zf.extractall(dest)
+
+
+def crx_zip_bytes(data):
+    """A .crx is a zip with a signed header in front. Returns just the zip part (plain zips pass through)."""
+    if data[:4] != b"Cr24":
+        return data
+    try:
+        ver = struct.unpack("<I", data[4:8])[0]
+        if ver == 2:
+            pk, sg = struct.unpack("<II", data[8:16])
+            return data[16 + pk + sg:]
+        if ver == 3:
+            return data[12 + struct.unpack("<I", data[8:12])[0]:]
+    except struct.error:
+        pass
+    raise ExtError("That .crx file is damaged or uses a format Fjord doesn't know.")
+
+
+def find_manifest_dir(base):
+    """The folder holding manifest.json: the folder itself, or inside a Safari .app / .appex (or an .ipa's Payload)."""
+    base = Path(base)
+    if (base / "manifest.json").is_file():
+        return base
+    for pat in ("Contents/PlugIns/*.appex/Contents/Resources", "Contents/Resources", "*.appex/Contents/Resources",
+                "*.app/Contents/PlugIns/*.appex/Contents/Resources", "PlugIns/*.appex", "Payload/*.app/PlugIns/*.appex",
+                "*.appex", "Resources"):
+        for d in sorted(base.glob(pat)):
+            if (d / "manifest.json").is_file():
+                return d
+    best = None  # last resort: a shallow search, preferring anything inside an .appex
+    base_depth = len(base.parts)
+    for dirpath, dirnames, filenames in os.walk(base):
+        depth = len(Path(dirpath).parts) - base_depth
+        if depth >= 7:
+            dirnames[:] = []
+        if "manifest.json" not in filenames:
+            continue
+        try:
+            m = load_manifest(Path(dirpath) / "manifest.json")
+        except Exception:
+            continue
+        if "manifest_version" in m and "name" in m:
+            score = (0 if ".appex" in dirpath else 1, depth)
+            if best is None or score < best[0]:
+                best = (score, Path(dirpath))
+    return best[1] if best else None
+
+
+def detect_kind(src, root, m):
+    low = (str(src) + "|" + str(root)).lower()
+    bss = m.get("browser_specific_settings") or m.get("applications") or {}
+    bss = bss if isinstance(bss, dict) else {}
+    if ".appex" in low or "safari" in bss or str(src).lower().endswith(".app"):
+        return "safari"
+    if str(src).lower().endswith(".xpi") or "gecko" in bss or "gecko_android" in bss:
+        return "firefox"
+    return "chrome"
+
+
+def adapt_manifest(m, root):
+    """Make a Firefox or Safari manifest something Chromium accepts, and give its code the `browser` API. Returns notes."""
+    root, notes = Path(root), []
+    for k in EXT_FIREFOX_KEYS:
+        m.pop(k, None)
+    for k in ("options_ui", "browser_action", "action", "page_action"):
+        if isinstance(m.get(k), dict):
+            for junk in ("browser_style", "default_area", "theme_icons"):
+                m[k].pop(junk, None)
+    mv = m.get("manifest_version", 2)
+    mv = mv if isinstance(mv, int) else 2
+
+    def clean_perms(key):
+        out = []
+        for p in m.get(key) or []:
+            p = "contextMenus" if p == "menus" else p
+            if isinstance(p, str) and p not in EXT_FIREFOX_PERMS and p not in out:
+                out.append(p)
+        return out
+    perms, optional = clean_perms("permissions"), clean_perms("optional_permissions")
+    if "nativeMessaging" in perms or "nativeMessaging" in optional:
+        notes.append("It uses native messaging (talking to an app on your computer), which Fjord can't do, so some features won't work.")
+    if mv >= 3:  # Manifest V3 keeps website access in host_permissions
+        for src_key, host_key, plist in (("permissions", "host_permissions", perms),
+                                         ("optional_permissions", "optional_host_permissions", optional)):
+            hosts = [p for p in plist if EXT_HOST_RE.match(p)]
+            if hosts:
+                plist[:] = [p for p in plist if p not in hosts]
+                have = m.get(host_key) if isinstance(m.get(host_key), list) else []
+                m[host_key] = have + [h for h in hosts if h not in have]
+    if "permissions" in m or perms:
+        m["permissions"] = perms
+    if "optional_permissions" in m or optional:
+        m["optional_permissions"] = optional
+
+    bg = m.get("background")
+    if isinstance(bg, dict):
+        scripts = [_rel(s) for s in bg.get("scripts") or [] if _rel(s)]
+        sw = _rel(bg.get("service_worker"))
+        module = bg.get("type") == "module"
+        if mv >= 3:
+            if sw:  # run the original worker after the shim, from a wrapper beside it so relative importScripts() still works
+                d = posixpath.dirname(sw)
+                wrapper = posixpath.join(d, "fjord-sw.js")
+                body = ("import '/%s';\nimport './%s';\n" if module else "importScripts('/%s', './%s');\n") % (EXT_SHIM, posixpath.basename(sw))
+                (root / wrapper).write_text(body, encoding="utf-8")
+                bg.pop("scripts", None)
+                bg["service_worker"] = wrapper
+            elif scripts:  # Firefox event pages become a service worker that loads the same scripts in order
+                if module:
+                    body = "import '/%s';\n" % EXT_SHIM + "".join("import '/%s';\n" % s for s in scripts)
+                else:
+                    body = "importScripts(%s);\n" % ", ".join(json.dumps("/" + s) for s in [EXT_SHIM] + scripts)
+                (root / "fjord-sw.js").write_text(body, encoding="utf-8")
+                m["background"] = dict({"service_worker": "fjord-sw.js"}, **({"type": "module"} if module else {}))
+                notes.append("It was written for a Firefox background page. Fjord runs it as a service worker, so parts that use the page itself may not work.")
+        else:
+            bg.pop("service_worker", None)
+            if scripts:
+                bg["scripts"] = [EXT_SHIM] + scripts
+    if mv < 3 and isinstance(m.get("action"), dict) and "browser_action" not in m:
+        m["browser_action"] = m.pop("action")
+    for cs in m.get("content_scripts") or []:
+        if isinstance(cs, dict) and isinstance(cs.get("js"), list) and cs["js"] and cs.get("world") != "MAIN":
+            cs["js"] = [EXT_SHIM] + cs["js"]
+    war = m.get("web_accessible_resources")
+    if mv >= 3 and isinstance(war, list) and any(isinstance(x, str) for x in war):  # V3 wants {resources, matches} objects
+        m["web_accessible_resources"] = [x for x in war if isinstance(x, dict)] + [
+            {"resources": [x for x in war if isinstance(x, str)], "matches": ["<all_urls>"]}]
+    if mv >= 3 and isinstance(m.get("content_security_policy"), str):
+        m["content_security_policy"] = {"extension_pages": m["content_security_policy"]}
+
+    (root / EXT_SHIM).write_text(EXT_SHIM_JS, encoding="utf-8")
+    tag, count = '<script src="/%s"></script>' % EXT_SHIM, 0
+    for f in sorted(root.rglob("*.htm*")):  # popups, options pages and background pages need the shim too
+        if count >= 300 or not f.is_file() or f.stat().st_size > 3_000_000:
+            continue
+        try:
+            s = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if EXT_SHIM in s:
+            continue
+        mt = re.search(r"<head(?:\s[^>]*)?>", s, re.I) or re.search(r"<html(?:\s[^>]*)?>", s, re.I)
+        s = (s[:mt.end()] + tag + s[mt.end():]) if mt else tag + s
+        f.write_text(s, encoding="utf-8")
+        count += 1
+    return notes
+
+
+def describe_permissions(m):
+    """Plain-language list of what an extension can do, for the confirmation dialog."""
+    perms = [p for p in (m.get("permissions") or []) if isinstance(p, str)]
+    hosts = [p for p in (m.get("host_permissions") or []) if isinstance(p, str)] + [p for p in perms if EXT_HOST_RE.match(p)]
+    for cs in m.get("content_scripts") or []:
+        if isinstance(cs, dict):
+            hosts += [x for x in cs.get("matches") or [] if isinstance(x, str)]
+    out = []
+    if any(EXT_ALL_SITES_RE.match(h) for h in hosts):
+        out.append("Read and change your data on all websites")
+    elif hosts:
+        n = len(set(hosts))
+        out.append("Read and change your data on %d site%s" % (n, "" if n == 1 else "s"))
+    for p in perms:
+        if p in EXT_PERM_TEXT:
+            out.append(EXT_PERM_TEXT[p])
+    return out
+
+
+def pick_icon(root, m):
+    icons = m.get("icons")
+    if not isinstance(icons, dict):
+        a = m.get("action") or m.get("browser_action") or {}
+        icons = a.get("default_icon") if isinstance(a, dict) else None
+        icons = {"48": icons} if isinstance(icons, str) else icons
+    best = None
+    for k, v in (icons.items() if isinstance(icons, dict) else []):
+        rel = _rel(v)
+        try:
+            n = int(k)
+        except (TypeError, ValueError):
+            continue
+        if rel.lower().endswith(".png") and (Path(root) / rel).is_file() and (best is None or abs(n - 64) < best[0]):
+            best = (abs(n - 64), rel)
+    return best[1] if best else ""
+
+
+def stage_extension(src):
+    """Unpack an extension (.crx, .xpi, .zip, .ipa, a folder, or a Safari .app/.appex) into EXT_DIR, converting Firefox and
+    Safari ones for Chromium. Returns a record describing it. Raises ExtError with a message fit to show."""
+    src = Path(src).expanduser()
+    low = src.name.lower()
+    if not src.exists():
+        raise ExtError("Fjord can't find that file.")
+    if low.endswith(".safariextz"):
+        raise ExtError("That is an old-style Safari extension (.safariextz). Apple retired them in 2018, so they can't run "
+                       "outside Safari. Safari Web Extensions work: pick the Mac app that contains the extension.")
+    if low.endswith((".dmg", ".pkg")):
+        raise ExtError("Fjord can't open disk images or installers. Open it first, then pick the .app inside.")
+    EXT_DIR.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="stage-", dir=str(EXT_DIR)))
+    try:
+        if src.is_dir():
+            base = src
+        else:
+            if src.stat().st_size > EXT_MAX_BYTES:
+                raise ExtError("That file is too large to be an extension.")
+            try:
+                zf = zipfile.ZipFile(io.BytesIO(crx_zip_bytes(src.read_bytes())))
+            except zipfile.BadZipFile:
+                raise ExtError("That file isn't an extension package. Fjord opens .crx, .xpi and .zip files, folders, and Safari apps.")
+            with zf:
+                safe_extract(zf, work / "src")
+            base = work / "src"
+        root = find_manifest_dir(base)
+        if root is None:
+            raise ExtError("Fjord couldn't find a manifest.json in there. Old-style Safari App Extensions (native Swift or "
+                           "Objective-C ones) can't run outside Safari; only Safari Web Extensions can.")
+        try:
+            m = load_manifest(root / "manifest.json")
+        except Exception:
+            raise ExtError("That extension's manifest.json can't be read.")
+        if "theme" in m and not any(k in m for k in ("background", "content_scripts", "action", "browser_action", "page_action")):
+            raise ExtError("That is a browser theme, not an extension. Fjord doesn't support browser themes.")
+        kind = detect_kind(src, root, m)
+        name = ext_label(root, m)
+        dest = EXT_DIR / ("%s-%s" % (re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:30] or "extension", secrets.token_hex(3)))
+        shutil.copytree(root, dest, ignore=shutil.ignore_patterns(".DS_Store", "__MACOSX"))
+        notes = []
+        if isinstance(m.get("manifest_version"), int) and m["manifest_version"] < 3:
+            notes.append("It uses the older Manifest V2 format. Chromium is phasing that out, so it may not load on newer versions of Qt.")
+        if kind in ("firefox", "safari"):
+            m2 = load_manifest(dest / "manifest.json")
+            notes += adapt_manifest(m2, dest)
+            (dest / "manifest.json").write_text(json.dumps(m2, indent=2), encoding="utf-8")
+        return {"dir": str(dest), "name": name, "version": str(m.get("version", "")), "kind": kind, "enabled": True,
+                "notes": notes, "can": describe_permissions(m), "icon": pick_icon(dest, m),
+                "options": _rel((m.get("options_ui") or {}).get("page") if isinstance(m.get("options_ui"), dict) else None)
+                or _rel(m.get("options_page"))}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def ext_crx_url(ext_id, chrome_ver="130.0.0.0"):
+    return ("https://clients2.google.com/service/update2/crx?response=redirect&prodversion=%s&acceptformat=crx2,crx3"
+            "&x=id%%3D%s%%26installsource%%3Dondemand%%26uc" % (chrome_ver, ext_id))
+
+
+def resolve_ext_url(text, chrome_ver="130.0.0.0"):
+    """Turn something pasted by the person into (what, url): a Chrome Web Store page or ID, a Firefox Add-ons page, or a
+    direct .crx/.xpi/.zip link. what is "crx", "amo" (an API address that names the .xpi) or "file"."""
+    t = (text or "").strip()
+    if re.fullmatch(r"[a-p]{32}", t):
+        return "crx", ext_crx_url(t, chrome_ver)
+    u = urlparse(t)
+    if u.scheme in ("http", "https"):
+        host = (u.hostname or "").lower()
+        if host in ("chromewebstore.google.com", "chrome.google.com"):
+            mt = re.search(r"/([a-p]{32})(?:/|$)", u.path)
+            if mt:
+                return "crx", ext_crx_url(mt.group(1), chrome_ver)
+        elif host == "addons.mozilla.org":
+            mt = re.search(r"/addon/([^/]+)", u.path)
+            if mt:
+                return "amo", "https://addons.mozilla.org/api/v5/addons/addon/%s/" % quote(unquote(mt.group(1)), safe="")
+        if u.path.lower().endswith((".crx", ".xpi", ".zip")):
+            return "file", t
+    raise ExtError("Paste a Chrome Web Store or Firefox Add-ons link, or the address of a .crx or .xpi file.")
+
+
+def ext_fetch(url, st, limit=EXT_MAX_BYTES):
+    """Download through urllib, honouring Fjord's proxy when it is on (so the download doesn't skip the VPN)."""
+    handlers = []
+    if st.get("vpn") and st.get("proxy_host") and st.get("proxy_port"):
+        if st.get("proxy_type", "socks5") != "http":
+            raise ExtError("Fjord's proxy is a %s one, which the extension downloader can't use. Download the file in a tab "
+                           "and choose Add from a file." % str(st.get("proxy_type", "socks5")).upper())
+        cred = ""
+        if st.get("proxy_user"):
+            cred = "%s:%s@" % (quote(st.get("proxy_user", ""), safe=""), quote(st.get("proxy_pw", ""), safe=""))
+        proxy = "http://%s%s:%s" % (cred, st["proxy_host"], st["proxy_port"])
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 FjordBrowser"})
+    try:
+        with urllib.request.build_opener(*handlers).open(req, timeout=40) as r:
+            data = r.read(limit + 1)
+    except Exception as ex:
+        raise ExtError("The download failed (%s). Check your connection and the link." % (getattr(ex, "reason", None) or ex))
+    if len(data) > limit:
+        raise ExtError("That download is too large to be an extension.")
+    if not data:
+        raise ExtError("The store has no download for that extension.")
+    return data
+
+
+def ext_download(text, st, chrome_ver):
+    """Fetch what resolve_ext_url describes into a temp file and return its path (caller deletes it)."""
+    what, url = resolve_ext_url(text, chrome_ver)
+    suffix = ".crx"
+    if what == "amo":
+        try:
+            info = json.loads(ext_fetch(url, st, 5 * 1024 * 1024).decode("utf-8", "replace"))
+            cur = info.get("current_version") or {}
+            f = cur.get("file") or (cur.get("files") or [{}])[0]
+            url = f.get("url")
+        except ExtError:
+            raise
+        except Exception:
+            url = None
+        if not url:
+            raise ExtError("Firefox Add-ons has no download for that add-on.")
+        suffix = ".xpi"
+    elif what == "file":
+        suffix = Path(urlparse(url).path).suffix.lower() or ".zip"
+    data = ext_fetch(url, st)
+    EXT_DIR.mkdir(parents=True, exist_ok=True)
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="dl-", dir=str(EXT_DIR))
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    return path
+
+
+class ExtPopup(QWebEngineView):
+    """An extension's toolbar popup: a small window under the toolbar button that closes when you click away."""
+
+    def __init__(self, browser, url):
+        super().__init__(browser)
+        self.browser = browser
+        self.setWindowFlags(Qt.WindowType.Popup)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setPage(QWebEnginePage(browser.profile, self))
+        self.page().windowCloseRequested.connect(self.close)
+        self.page().contentsSizeChanged.connect(self._fit)
+        self.resize(280, 160)
+        self._right = None
+        self.load(url)
+
+    def createWindow(self, _type):
+        return self.browser.new_tab(blank=True)
+
+    def _fit(self, size):
+        w, h = int(min(max(size.width(), 240), 800)), int(min(max(size.height(), 120), 600))
+        if (w, h) != (self.width(), self.height()):
+            self.resize(w, h)
+            if self._right is not None:
+                self.move(self._right.x() - w, self._right.y())
+
+    def show_under(self, button):
+        p = button.mapToGlobal(button.rect().bottomRight())
+        self._right = QPoint(p.x(), p.y() + 4)
+        self.move(self._right.x() - self.width(), self._right.y())
+        self.show()
+
+
+class ExtensionHub(QObject):
+    """Keeps the list of installed extensions (~/.fjord_browser/extensions.json) and loads them into the profile through Qt
+    WebEngine's extension manager. That manager only exists in PyQt6-WebEngine 6.10+, so `available` says whether it does."""
+    changed = pyqtSignal()
+    staged = pyqtSignal(object)   # (record or None, error text), sent from the worker thread that unpacked a package
+
+    def __init__(self, browser):
+        super().__init__(browser)
+        self.b = browser
+        self.records = [r for r in jload("extensions.json", []) if isinstance(r, dict) and r.get("dir")]
+        self.errors = {}
+        self.mgr = None
+        try:
+            if QWebEngineExtensionManager is not None:
+                self.mgr = browser.profile.extensionManager()
+        except Exception:
+            self.mgr = None
+        if self.mgr is not None:
+            for sig in ("installFinished", "loadFinished", "unloadFinished", "uninstallFinished"):
+                try:
+                    getattr(self.mgr, sig).connect(lambda *_a: self.changed.emit())
+                except Exception:
+                    pass
+        self.staged.connect(self._staged)
+
+    @property
+    def available(self):
+        return self.mgr is not None
+
+    def save(self):
+        jsave("extensions.json", self.records)
+
+    def record(self, name):
+        return next((r for r in self.records if Path(r["dir"]).name == name), None)
+
+    def info_for(self, rec):
+        if self.mgr is None:
+            return None
+        want = os.path.normcase(os.path.realpath(rec["dir"]))
+        try:
+            for info in self.mgr.extensions():
+                try:
+                    if os.path.normcase(os.path.realpath(info.path())) == want:
+                        return info
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return None
+
+    def error_for(self, rec):
+        err = self.errors.get(rec["dir"], "")
+        info = self.info_for(rec)
+        if not err and info is not None:
+            try:
+                err = str(info.error() or "")
+            except Exception:
+                err = ""
+        return err
+
+    def _call(self, method, *args):
+        fn = getattr(self.mgr, method, None)
+        if fn is None:
+            return False
+        try:
+            fn(*args)
+            return True
+        except Exception:
+            return False
+
+    def load_all(self):
+        for r in self.records:
+            if r.get("enabled", True) and Path(r["dir"]).is_dir():
+                self._load(r)
+
+    def _load(self, rec):
+        if self.mgr is None:
+            return False
+        self.errors.pop(rec["dir"], None)
+        if not self._call("loadExtension", rec["dir"]):
+            self.errors[rec["dir"]] = "This version of Qt couldn't load it."
+            return False
+        return True
+
+    def _unload(self, rec):
+        info = self.info_for(rec)
+        if info is not None:
+            self._call("unloadExtension", info)
+
+    # ----- adding -----
+    def _ready(self):
+        if self.available:
+            return True
+        from PyQt6.QtCore import QT_VERSION_STR
+        self.b.toast("Extensions need PyQt6-WebEngine 6.10 or newer (this is Qt %s)" % QT_VERSION_STR, 7000)
+        return False
+
+    def add_path(self, path):
+        if not self._ready():
+            return
+        self.b.toast("Unpacking extension…", 4000)
+
+        def work():
+            try:
+                self.staged.emit((stage_extension(path), ""))
+            except ExtError as ex:
+                self.staged.emit((None, str(ex)))
+            except Exception as ex:
+                self.staged.emit((None, "Fjord couldn't read that extension (%s)." % ex))
+        threading.Thread(target=work, daemon=True).start()
+
+    def add_url(self, text):
+        if not self._ready():
+            return
+        try:
+            resolve_ext_url(text)  # fail fast on something that isn't a store or file link
+        except ExtError as ex:
+            self.b.toast(str(ex), 7000)
+            return
+        self.b.toast("Downloading extension…", 6000)
+        st = dict(self.b.settings)
+        m = re.search(r"Chrome/([\d.]+)", self.b.profile.httpUserAgent())
+
+        def work():
+            tmp, result = None, (None, "")
+            try:
+                tmp = ext_download(text, st, m.group(1) if m else "130.0.0.0")
+                result = (stage_extension(tmp), "")
+            except ExtError as ex:
+                result = (None, str(ex))
+            except Exception as ex:
+                result = (None, "Fjord couldn't add that extension (%s)." % ex)
+            finally:
+                if tmp:  # the download is unpacked (or failed), so it is no longer needed
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+            self.staged.emit(result)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _staged(self, payload):
+        rec, err = payload
+        if rec is None:
+            self.b.toast(err or "Fjord couldn't add that extension.", 8000)
+            self.changed.emit()
+            return
+        can = rec.get("can") or []
+        text = ('Add "%s" (%s)?\n\n' % (rec["name"], EXT_KINDS.get(rec["kind"], "Chrome"))
+                + ("It will be able to:\n" + "\n".join("  \u2022 " + c for c in can[:8]) + ("\n  \u2022 and %d more" % (len(can) - 8) if len(can) > 8 else "")
+                   if can else "It doesn't ask for any special access.")
+                + ("\n\n" + "\n".join(rec.get("notes", [])) if rec.get("notes") else ""))
+        if QMessageBox.question(self.b, "Add extension", text) != QMessageBox.StandardButton.Yes:
+            shutil.rmtree(rec["dir"], ignore_errors=True)
+            return
+        self.records.append(rec)
+        self.save()
+        self._load(rec)
+        self.b.toast('Added "%s". Reload open tabs to use it.' % rec["name"], 5000)
+        self.changed.emit()
+
+    # ----- managing -----
+    def toggle(self, name):
+        rec = self.record(name)
+        if rec is None:
+            return
+        rec["enabled"] = not rec.get("enabled", True)
+        self.save()
+        if rec["enabled"]:
+            self._load(rec)
+        else:
+            self._unload(rec)
+        self.changed.emit()
+
+    def remove(self, name):
+        rec = self.record(name)
+        if rec is None:
+            return
+        self._unload(rec)
+        self.records = [r for r in self.records if r is not rec]
+        self.save()
+        shutil.rmtree(rec["dir"], ignore_errors=True)
+        self.changed.emit()
+
+    def popup(self, name):
+        rec = self.record(name)
+        info = self.info_for(rec) if rec else None
+        url = None
+        try:
+            url = info.actionPopupUrl() if info is not None else None
+        except Exception:
+            pass
+        if url is None or url.isEmpty():
+            self.b.toast("%s has no popup%s" % (rec["name"] if rec else "That extension",
+                                                  "" if info is not None else " (it isn't loaded)"), 3500)
+            return
+        self._popup = ExtPopup(self.b, url)
+        self._popup.show_under(self.b.btn_ext)
+
+    def options(self, name):
+        rec = self.record(name)
+        info = self.info_for(rec) if rec else None
+        if rec is None or info is None or not rec.get("options"):
+            self.b.toast("%s has no settings page" % (rec["name"] if rec else "That extension"), 3500)
+            return
+        self.b.new_tab(QUrl("chrome-extension://%s/%s" % (info.id(), rec["options"])))
+
+
+def ext_icon_uri(rec):
+    try:
+        p = Path(rec["dir"]) / rec["icon"]
+        if rec.get("icon") and p.stat().st_size < 200_000:
+            return "data:image/png;base64," + base64.b64encode(p.read_bytes()).decode()
+    except (OSError, KeyError):
+        pass
+    return ""
+
+
+def extensions_html(b):
+    e = html.escape
+    hub = b.extensions
+    rows = ""
+    for r in hub.records:
+        d = quote(Path(r["dir"]).name, safe="")
+        on = bool(r.get("enabled", True))
+        err = hub.error_for(r) if on else ""
+        sub = e("%s \u00b7 version %s" % (EXT_KINDS.get(r.get("kind"), "Chrome"), r.get("version") or "?"))
+        if err:
+            sub += '<br><span style="color:#ff9a9a">%s</span>' % e(err)
+        for n in r.get("notes") or []:
+            sub += "<br>" + e(n)
+        uri = ext_icon_uri(r)
+        icon = ('<img src="%s" style="width:28px;height:28px;border-radius:7px;margin-right:12px;flex:none">' % uri) if uri else ""
+        links = ""
+        if on and r.get("options"):
+            links += '<a class=x href="fjord://ext-options?d=%s">Settings</a>' % d
+        if on:
+            links += '<a class=x href="fjord://ext-popup?d=%s">Open</a>' % d
+        links += '<a class=x href="fjord://ext-remove?d=%s">Remove</a>' % d
+        rows += ('<div class=row><div style="display:flex;align-items:center;min-width:0">%s<div>%s<small style="white-space:normal">%s</small></div></div>'
+                 '<div style="display:flex;align-items:center;gap:4px;flex:none">%s<a class="sw%s" href="fjord://ext-toggle?d=%s"><i></i></a></div></div>'
+                 % (icon, e(r["name"]), sub, links, " on" if on else "", d))
+    if not rows:
+        rows = '<div class=hint style="padding-top:14px">No extensions yet. Add one below.</div>'
+    warn = ""
+    if not hub.available:
+        from PyQt6.QtCore import QT_VERSION_STR
+        warn = ('<h2>Not available yet</h2><div class=card><div class=row><div>This copy of Qt WebEngine can\'t run extensions'
+                '<small>Extensions need PyQt6-WebEngine 6.10 or newer, and this one is Qt %s. Run: pip install -U PyQt6 '
+                'PyQt6-WebEngine, then restart Fjord.</small></div></div></div>' % e(QT_VERSION_STR))
+    add = ('<h2>Add an extension</h2><div class=card>'
+           '<form class=pf action="fjord://ext-url"><div class=fr><input name=u placeholder="Chrome Web Store or Firefox Add-ons link">'
+           '<button>Add</button></div></form>'
+           '<div class=row><div>From a file<small>A .crx, .xpi or .zip file</small></div><a class=x href="fjord://ext-add?m=file">Choose file…</a></div>'
+           '<div class=row><div>From a folder or Mac app<small>An unpacked extension, or a Safari extension\'s .app (usually in Applications)</small></div>'
+           '<a class=x href="fjord://ext-add?m=folder">Choose folder…</a></div>'
+           '<div class=hint style="padding-top:12px">Chrome extensions run as they are. Firefox and Safari extensions are converted when you add them, '
+           'so a few that rely on browser-specific features may not work. Safari\'s older native App Extensions can\'t run outside Safari.</div></div>')
+    return ("<!doctype html><meta charset=utf-8><meta name=color-scheme content=dark><title>Extensions</title><style>" + base_css()
+            + themed(SETTINGS_CSS) + "</style><main><h1>Extensions</h1>" + warn + "<h2>Installed</h2><div class=card>" + rows
+            + "</div>" + add + "</main>")
+
+
 class Page(QWebEnginePage):
     def __init__(self, profile, tab):
         super().__init__(profile, tab)
@@ -1723,7 +2537,8 @@ class Page(QWebEnginePage):
         tab.browser.adblock.install(self)
 
     def acceptNavigationRequest(self, url, nav_type, is_main):
-        if is_main and url.scheme() == "fjord" and url.host() in ("clear-history", "remove-bookmark", "search", "set", "ess-remove", "ess-add", "vpn", "adblock-update", "allow-remove", "top-add", "top-remove", "bg"):
+        if is_main and url.scheme() == "fjord" and url.host() in ("clear-history", "remove-bookmark", "search", "set", "ess-remove", "ess-add", "vpn", "adblock-update", "allow-remove", "top-add", "top-remove", "bg",
+                                                                "ext-open", "ext-add", "ext-url", "ext-toggle", "ext-remove", "ext-popup", "ext-options"):
             QTimer.singleShot(0, lambda: self.tab.browser.internal_action(url))
             return False
         if is_main and url.scheme() in ("http", "https"):
@@ -3507,6 +4322,16 @@ def draw_glyph(p, kind, rect, color, width=1.6):
         path.arcTo(rr, 210, -240)
         line((12, 12.3), (12, 6.1))
         path.addEllipse(QPointF(12, 12.3), 1.1, 1.1)
+    elif kind == "puzzle":  # a jigsaw piece: square body with a knob on top and one on the right
+        path.moveTo(4.5, 8.5)
+        path.lineTo(9.6, 8.5)
+        path.cubicTo(8.2, 3.8, 15.8, 3.8, 14.4, 8.5)
+        path.lineTo(17, 8.5)
+        path.lineTo(17, 10.6)
+        path.cubicTo(21.7, 9.2, 21.7, 16.8, 17, 15.4)
+        path.lineTo(17, 20)
+        path.lineTo(4.5, 20)
+        path.closeSubpath()
     elif kind == "dots":
         p.setBrush(QColor(color))
         for cx in (5.5, 12, 18.5):
@@ -3789,6 +4614,527 @@ class ToolIcon(FadeButton):
         g = float(self.GLYPH)
         draw_glyph(p, self.kind, QRectF(r.center().x() - g / 2, r.center().y() - g / 2, g, g), col, self.STROKE)
         p.end()
+
+
+# ----- customisable toolbar -----
+TB_MIME = "application/x-fjord-tbitem"
+# id -> label. Order here is the order hidden items show up in the customise tray.
+TB_ITEMS = {"side": "Sidebar", "back": "Back", "fwd": "Forward", "reload": "Reload", "engine": "Search engine",
+            "speed": "Speed", "vpn": "VPN / Proxy", "ext": "Extensions", "star": "Bookmark", "scratch": "Scratchpad",
+            "menu": "Menu"}
+TB_GLYPHS = {"side": "sidebar", "back": "back", "fwd": "forward", "reload": "reload", "speed": "speed", "vpn": "shield",
+             "ext": "puzzle", "star": "star", "scratch": "scratch", "menu": "dots"}
+TB_DEFAULT = ["side", "back", "fwd", "reload", "addr", "engine", "speed", "vpn", "ext", "star", "scratch", "menu"]
+TB_FIXED = ("addr", "menu")  # these always stay on the toolbar, so you can never lock yourself out
+TB_STRETCH = {"addr": 5, "space": 1}
+_TB_INST = re.compile(r"^(sep|space)#\d+$")
+
+
+def tb_base(iid):
+    return iid.split("#")[0]
+
+
+def clean_toolbar(raw):
+    """Turn whatever settings.json holds into a valid toolbar order (unknown/duplicate ids dropped, addr + menu kept)."""
+    if not isinstance(raw, list):
+        return list(TB_DEFAULT)
+    out = []
+    for x in raw:
+        if isinstance(x, str) and x not in out and (x in TB_ITEMS or x == "addr" or _TB_INST.match(x)):
+            out.append(x)
+    if "addr" not in out:
+        out.insert(out.index("reload") + 1 if "reload" in out else 0, "addr")
+    if "menu" not in out:
+        out.append("menu")
+    return out
+
+
+class TbSeparator(QWidget):
+    """A thin vertical divider line between toolbar buttons."""
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(11, ToolIcon.SIZE)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setPen(QPen(QColor(255, 255, 255, 46), 1))
+        x = self.width() // 2
+        p.drawLine(x, 9, x, self.height() - 9)
+        p.end()
+
+
+class TbSpacer(QWidget):
+    """Flexible empty space that pushes the buttons on either side apart. Only visible while customising."""
+    def __init__(self):
+        super().__init__()
+        self.editing = False
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(ToolIcon.SIZE)
+        self.setMinimumWidth(6)
+
+    def set_editing(self, on):
+        self.editing = on
+        self.setMinimumWidth(34 if on else 6)
+        self.update()
+
+    def paintEvent(self, e):
+        if not self.editing:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = QColor(255, 255, 255, 70)
+        p.setPen(QPen(c, 1.3))
+        y, x0, x1 = self.height() / 2.0, 8.0, self.width() - 8.0
+        if x1 - x0 > 14:
+            p.drawLine(QPointF(x0, y), QPointF(x1, y))
+            p.drawLine(QPointF(x0, y), QPointF(x0 + 5, y - 4))
+            p.drawLine(QPointF(x0, y), QPointF(x0 + 5, y + 4))
+            p.drawLine(QPointF(x1, y), QPointF(x1 - 5, y - 4))
+            p.drawLine(QPointF(x1, y), QPointF(x1 - 5, y + 4))
+        p.end()
+
+
+class TbOverlay(QWidget):
+    """Sits on top of the toolbar while customising. It swallows clicks (so buttons don't fire), draws the dashed
+    outlines and the drop marker, starts drags, and is the drop target for rearranging."""
+    def __init__(self, ed):
+        super().__init__(ed.win.toolbar)
+        self.ed = ed
+        self.hover = self.press = self.press_pos = self.marker = self.src = None
+        self.setMouseTracking(True)
+        self.setAcceptDrops(True)
+        self.hide()
+
+    def item_at(self, pos):
+        for _i, iid, w in self.ed.visible_items():
+            if iid != "addr" and w.geometry().contains(pos):
+                return iid
+        return None
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        self.press_pos = e.position().toPoint()
+        self.press = self.item_at(self.press_pos)
+        if self.press is None:  # bare toolbar still drags the window
+            h = self.window().windowHandle()
+            if h and not self.window().isFullScreen():
+                h.startSystemMove()
+
+    def mouseReleaseEvent(self, e):
+        self.press = None
+
+    def mouseMoveEvent(self, e):
+        pos = e.position().toPoint()
+        if (e.buttons() & Qt.MouseButton.LeftButton) and self.press is not None \
+                and (pos - self.press_pos).manhattanLength() >= QApplication.startDragDistance():
+            iid, self.press = self.press, None
+            self.ed.drag_item(iid, self.ed.widget(iid))
+            return
+        h = self.item_at(pos)
+        if h != self.hover:
+            self.hover = h
+            self.setCursor(Qt.CursorShape.OpenHandCursor if h else Qt.CursorShape.ArrowCursor)
+            self.update()
+
+    def leaveEvent(self, e):
+        self.hover = None
+        self.update()
+
+    def contextMenuEvent(self, e):
+        iid = self.item_at(e.pos())
+        m = QMenu(self)
+        if iid and tb_base(iid) not in TB_FIXED:
+            m.addAction("Remove from toolbar", lambda: self.ed.remove(iid))
+        m.addAction("Reset toolbar", self.ed.reset)
+        m.addAction("Done", self.ed.stop)
+        m.exec(e.globalPos())
+
+    def _mime_id(self, e):
+        if not e.mimeData().hasFormat(TB_MIME):
+            return None
+        return bytes(e.mimeData().data(TB_MIME)).decode("utf-8", "ignore")
+
+    def dragEnterEvent(self, e):
+        self.dragMoveEvent(e)
+
+    def dragMoveEvent(self, e):
+        if self._mime_id(e) is None:
+            e.ignore()
+            return
+        e.acceptProposedAction()
+        self.marker = self.ed.slot_at(e.position().toPoint().x())[1]
+        self.update()
+
+    def dragLeaveEvent(self, e):
+        self.marker = None
+        self.update()
+
+    def dropEvent(self, e):
+        iid = self._mime_id(e)
+        if iid is None:
+            return
+        idx = self.ed.slot_at(e.position().toPoint().x())[0]
+        self.marker = None
+        e.acceptProposedAction()
+        self.ed.pending = lambda: self.ed.place(iid, idx)  # applied once the drag has fully ended
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for _i, iid, w in self.ed.visible_items():
+            if iid == "addr":
+                continue
+            r = QRectF(w.geometry()).adjusted(0.5, 0.5, -0.5, -0.5)
+            hot = iid == self.hover
+            p.setPen(Qt.PenStyle.NoPen)
+            if iid == self.src:
+                p.setBrush(QColor(0, 0, 0, 120))
+            elif hot:
+                p.setBrush(accent_color(34))
+            else:
+                p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(r, 12, 12)
+            pen = QPen(accent_color(170 if hot else 90), 1.2)
+            pen.setDashPattern([3.0, 3.0])
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(r, 12, 12)
+        if self.marker is not None:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(accent_color())
+            p.drawRoundedRect(QRectF(self.marker - 1.5, 3, 3, self.height() - 6), 1.5, 1.5)
+        p.end()
+
+
+class TbTile(QWidget):
+    """A hidden toolbar item (or a new separator / flexible space) in the customise tray; drag it onto the toolbar."""
+    W, H = 74, 62
+
+    def __init__(self, ed, iid):
+        super().__init__()
+        self.ed, self.iid, self.press_pos = ed, iid, None
+        self.setFixedSize(self.W, self.H)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("Drag onto the toolbar")
+
+    def label(self):
+        return {"sep": "Separator", "space": "Flexible space"}.get(self.iid) or TB_ITEMS.get(self.iid, self.iid)
+
+    def mousePressEvent(self, e):
+        self.press_pos = e.position().toPoint() if e.button() == Qt.MouseButton.LeftButton else None
+
+    def mouseMoveEvent(self, e):
+        if (e.buttons() & Qt.MouseButton.LeftButton) and self.press_pos is not None \
+                and (e.position().toPoint() - self.press_pos).manhattanLength() >= QApplication.startDragDistance():
+            self.press_pos = None
+            self.ed.drag_item(self.iid, self)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 16))
+        p.drawRoundedRect(QRectF(self.rect()), 12, 12)
+        cx, cy, col = self.W / 2.0, 22.0, QColor(themed("#b5c6d4"))
+        if self.iid == "sep":
+            p.setPen(QPen(col, 1.5))
+            p.drawLine(QPointF(cx, cy - 9), QPointF(cx, cy + 9))
+        elif self.iid == "space":
+            p.setPen(QPen(col, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(QPointF(cx - 12, cy), QPointF(cx + 12, cy))
+            for s in (-1, 1):
+                p.drawLine(QPointF(cx + 12 * s, cy), QPointF(cx + 7 * s, cy - 4))
+                p.drawLine(QPointF(cx + 12 * s, cy), QPointF(cx + 7 * s, cy + 4))
+        elif self.iid == "engine":
+            pm = engine_icon(self.ed.win.engine).pixmap(20, 20)
+            p.drawPixmap(int(cx - 10), int(cy - 10), pm)
+        else:
+            draw_glyph(p, TB_GLYPHS.get(self.iid, "dots"), QRectF(cx - 10, cy - 10, 20, 20), col, 1.7)
+        p.setPen(QColor(themed("#8ea3b4")))
+        f = p.font()
+        f.setPixelSize(10)
+        p.setFont(f)
+        txt = QFontMetrics(f).elidedText(self.label(), Qt.TextElideMode.ElideRight, self.W - 8)
+        p.drawText(QRectF(0, 38, self.W, 18), Qt.AlignmentFlag.AlignCenter, txt)
+        p.end()
+
+
+class TbPanel(QFrame):
+    """The tray under the toolbar while customising: hidden items live here. Drop a toolbar button on it to remove it."""
+    def __init__(self, ed):
+        super().__init__()
+        self.ed, self.tiles, self.cols, self.over = ed, [], 0, False
+        self.setObjectName("tbpanel")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAcceptDrops(True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 14)
+        lay.setSpacing(8)
+        head = QHBoxLayout()
+        title = QLabel("Customize toolbar")
+        title.setObjectName("tbtitle")
+        reset = QPushButton("Reset")
+        reset.setObjectName("tbreset")
+        done = QPushButton("Done")
+        done.setObjectName("tbdone")
+        for b in (reset, done):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        reset.clicked.connect(lambda: ed.reset())
+        done.clicked.connect(lambda: ed.stop())
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(reset)
+        head.addWidget(done)
+        hint = QLabel("Drag buttons on the toolbar to rearrange them. Drop them here to remove them, "
+                      "or drag items from here onto the toolbar to add them.")
+        hint.setObjectName("tbhint")
+        hint.setWordWrap(True)
+        self.grid = QGridLayout()
+        self.grid.setSpacing(8)
+        lay.addLayout(head)
+        lay.addWidget(hint)
+        lay.addLayout(self.grid)
+        self.hide()
+
+    def refresh(self):
+        for t in self.tiles:
+            t.hide()
+            t.deleteLater()
+        self.tiles = [TbTile(self.ed, i) for i in self.ed.hidden_ids() + ["sep", "space"]]
+        self.cols = 0
+        self.arrange()
+
+    def arrange(self):
+        cols = max(1, (self.width() - 32) // (TbTile.W + 8))
+        if cols == self.cols:
+            return
+        self.cols = cols
+        while self.grid.count():
+            self.grid.takeAt(0)
+        for c in range(40):
+            self.grid.setColumnStretch(c, 0)
+        for n, t in enumerate(self.tiles):
+            self.grid.addWidget(t, n // cols, n % cols, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            t.show()
+        self.grid.setColumnStretch(cols, 1)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.arrange()
+
+    def dragEnterEvent(self, e):
+        self.dragMoveEvent(e)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasFormat(TB_MIME):
+            e.acceptProposedAction()
+            if not self.over:
+                self.over = True
+                self.update()
+        else:
+            e.ignore()
+
+    def dragLeaveEvent(self, e):
+        self.over = False
+        self.update()
+
+    def dropEvent(self, e):
+        iid = bytes(e.mimeData().data(TB_MIME)).decode("utf-8", "ignore")
+        self.over = False
+        self.update()
+        e.acceptProposedAction()
+        self.ed.pending = lambda: self.ed.remove(iid)
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self.over:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            pen = QPen(accent_color(190), 1.4)
+            pen.setDashPattern([4.0, 4.0])
+            p.setPen(pen)
+            p.setBrush(accent_color(24))
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 16, 16)
+            p.end()
+
+
+class ToolbarEditor(QObject):
+    """Owns the toolbar's item order (saved in settings.json) and the drag-and-drop customise mode."""
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.editing = False
+        self.pending = None
+        self.order = clean_toolbar(win.settings.get("toolbar"))
+        self.seq = 1 + max([int(x.split("#")[1]) for x in self.order if "#" in x] or [0])
+        self.widgets = {"addr": win.addr, "side": win.btn_side, "back": win.btn_back, "fwd": win.btn_fwd,
+                        "reload": win.btn_reload, "engine": win.btn_engine, "speed": win.btn_speed,
+                        "vpn": win.btn_vpn, "ext": win.btn_ext, "star": win.btn_star,
+                        "scratch": win.scratch_btn, "menu": win.btn_menu}
+        self.overlay = TbOverlay(self)
+        self.panel = TbPanel(self)
+        self._tick = QTimer(self)  # keeps the overlay glued to the layout while buttons move around
+        self._tick.setInterval(40)
+        self._tick.timeout.connect(self._sync)
+
+    # --- layout ---
+    def widget(self, iid):
+        w = self.widgets.get(iid)
+        if w is None:
+            w = TbSeparator() if tb_base(iid) == "sep" else TbSpacer()
+            w.setParent(self.win.toolbar)
+            self.widgets[iid] = w
+        return w
+
+    def apply(self):
+        """Put the toolbar widgets in the saved order. Items that are off the toolbar are hidden."""
+        win, lay = self.win, self.win.tb_lay
+        horiz = bool(getattr(win, "horiz", False))
+        for w in self.widgets.values():
+            lay.removeWidget(w)
+        lay.removeWidget(win.drag_zone)
+        lay.removeWidget(win.winctl)
+        for iid in [i for i in self.widgets if "#" in i and i not in self.order]:
+            w = self.widgets.pop(iid)
+            w.hide()
+            w.deleteLater()
+        shown = set()
+        for iid in self.order:
+            if (iid == "side" and horiz) or (iid == "scratch" and not horiz):
+                continue  # no sidebar button without a sidebar; the scratchpad icon sits in the sidebar otherwise
+            w = self.widget(iid)
+            lay.addWidget(w, TB_STRETCH.get(tb_base(iid), 0))
+            w.show()
+            if isinstance(w, TbSpacer):
+                w.set_editing(self.editing)
+            shown.add(iid)
+        lay.addWidget(win.drag_zone)
+        lay.addWidget(win.winctl)
+        for iid, w in self.widgets.items():
+            if iid not in shown and not (iid == "scratch" and not horiz):
+                w.hide()
+        if self.editing:
+            self.panel.refresh()
+            self.overlay.update()
+
+    def available(self, iid):
+        horiz = bool(getattr(self.win, "horiz", False))
+        return not ((iid == "side" and horiz) or (iid == "scratch" and not horiz))
+
+    def hidden_ids(self):
+        return [i for i in TB_ITEMS if i not in self.order and self.available(i)]
+
+    def visible_items(self):
+        out = []
+        for i, iid in enumerate(self.order):
+            w = self.widgets.get(iid)
+            if w is not None and w.isVisibleTo(self.win.toolbar):
+                out.append((i, iid, w))
+        return out
+
+    def slot_at(self, x):
+        """Where would an item dropped at toolbar x land? -> (index into self.order, x of the drop marker)."""
+        vis = self.visible_items()
+        if not vis:
+            return 0, 6
+        k = sum(1 for _i, _id, w in vis if w.geometry().center().x() < x)
+        if k < len(vis):
+            return vis[k][0], vis[k][2].geometry().left() - 3
+        return vis[-1][0] + 1, vis[-1][2].geometry().right() + 4
+
+    # --- changing the order ---
+    def set_order(self, order):
+        self.order = clean_toolbar(order)
+        self.win.settings["toolbar"] = list(self.order)
+        jsave("settings.json", self.win.settings)
+        self.apply()
+
+    def place(self, iid, idx):
+        if not (iid in TB_ITEMS or iid == "addr" or iid in ("sep", "space") or _TB_INST.match(iid)):
+            return
+        order = list(self.order)
+        if iid in order:
+            s = order.index(iid)
+            order.pop(s)
+            if s < idx:
+                idx -= 1
+        elif iid in ("sep", "space"):  # from the tray: make a fresh copy
+            iid = "%s#%d" % (iid, self.seq)
+            self.seq += 1
+        order.insert(max(0, min(idx, len(order))), iid)
+        self.set_order(order)
+
+    def remove(self, iid):
+        if iid not in self.order:
+            return
+        if tb_base(iid) in TB_FIXED:
+            self.win.toast("That one has to stay on the toolbar", 2500)
+            return
+        self.set_order([i for i in self.order if i != iid])
+
+    def reset(self):
+        self.set_order(list(TB_DEFAULT))
+
+    # --- customise mode ---
+    def drag_item(self, iid, src):
+        drag = QDrag(self.overlay)
+        mime = QMimeData()
+        mime.setData(TB_MIME, iid.encode())
+        drag.setMimeData(mime)
+        pm = src.grab()
+        ghost = QPixmap(pm.size())
+        ghost.fill(Qt.GlobalColor.transparent)
+        gp = QPainter(ghost)
+        gp.setOpacity(0.85)
+        gp.drawPixmap(0, 0, pm)
+        gp.end()
+        drag.setPixmap(ghost)
+        drag.setHotSpot(QPoint(pm.width() // 2, pm.height() // 2))
+        self.overlay.src = iid if iid in self.order else None
+        self.overlay.update()
+        self.pending = None
+        drag.exec(Qt.DropAction.MoveAction)
+        self.overlay.src = self.overlay.marker = None
+        self.overlay.update()
+        fn, self.pending = self.pending, None
+        if fn:  # do the change after the drag loop has ended, so widgets it replaces aren't deleted mid-drag
+            QTimer.singleShot(0, fn)
+
+    def _sync(self):
+        self.overlay.setGeometry(0, 0, max(0, self.win.drag_zone.x()), self.win.toolbar.height())
+        self.overlay.raise_()
+        self.overlay.update()
+
+    def start(self):
+        if self.editing:
+            return
+        if self.win.isFullScreen() or not self.win.toolbar.isVisible():
+            self.win.toast("Leave full screen to customize the toolbar", 3000)
+            return
+        self.editing = True
+        self.win.addr.clearFocus()
+        for w in self.widgets.values():
+            if isinstance(w, TbSpacer):
+                w.set_editing(True)
+        self.panel.refresh()
+        self.panel.show()
+        self.overlay.show()
+        self._sync()
+        self._tick.start()
+
+    def stop(self):
+        if not self.editing:
+            return
+        self.editing = False
+        self._tick.stop()
+        self.overlay.hide()
+        self.panel.hide()
+        for w in self.widgets.values():
+            if isinstance(w, TbSpacer):
+                w.set_editing(False)
 
 
 def default_winbtns():
@@ -4613,6 +5959,9 @@ class Browser(QMainWindow):
         self.interceptor = AdInterceptor(self.adblock)
         self.profile.setUrlRequestInterceptor(self.interceptor)
         self.adblock.install_global(self.profile)
+        self.extensions = ExtensionHub(self)
+        self.extensions.changed.connect(self.on_ext_changed)
+        self.extensions.load_all()
         self._build_ui()
         self._build_shortcuts()
         self.refresh_completer()
@@ -4722,6 +6071,7 @@ class Browser(QMainWindow):
         self.btn_speed = ToolIcon("speed", "", self.show_speed_menu)
         self.update_speed_btn()
         self.btn_vpn = ToolIcon("shield", "Proxy/VPN is off - click to turn on", self.toggle_vpn)
+        self.btn_ext = ToolIcon("puzzle", "Extensions", self.show_ext_menu)
         self.btn_star = ToolIcon("star", "Bookmark this page  (Ctrl+D)", self.toggle_bookmark)
         self.btn_menu = ToolIcon("dots", "Menu", self.show_menu)
         self.drag_zone = QWidget()  # a bit of bare toolbar to grab and drag the window by
@@ -4730,17 +6080,9 @@ class Browser(QMainWindow):
         self.winctl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.winctl.customContextMenuRequested.connect(
             lambda pos: self.winbtn_menu().exec(self.winctl.mapToGlobal(pos)))
-        for w in (self.btn_side, self.btn_back, self.btn_fwd, self.btn_reload):
-            tb.addWidget(w)
-        tb.addWidget(self.addr, 1)
-        tb.addWidget(self.btn_engine)
-        tb.addWidget(self.btn_speed)
-        tb.addWidget(self.btn_vpn)
-        tb.addWidget(self.btn_star)
-        tb.addWidget(self.btn_menu)
-        tb.addWidget(self.drag_zone)
-        tb.addWidget(self.winctl)
-        right.addWidget(self.toolbar)
+        self.toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.toolbar.customContextMenuRequested.connect(self.toolbar_menu)
+        right.addWidget(self.toolbar)  # the buttons themselves are placed by ToolbarEditor.apply() below
 
         self.progress = QProgressBar()
         self.progress.setTextVisible(False)
@@ -4773,6 +6115,9 @@ class Browser(QMainWindow):
         self.scratch = ScratchDrawer(self, root)
         DropTarget.scratch = self.scratch
         self.scratch_btn.clicked.connect(self.scratch.toggle)
+        self.tb_ed = ToolbarEditor(self)
+        right.insertWidget(right.indexOf(self.toolbar) + 1, self.tb_ed.panel)
+        self.tb_ed.apply()
         self._build_frame(root)
 
     # ----- frameless window: resize edges, dragging, window buttons -----
@@ -5417,7 +6762,6 @@ class Browser(QMainWindow):
             self.strip.show()
             self.side.hide()
             self.edge.hide()
-            self.tb_lay.insertWidget(self.tb_lay.indexOf(self.btn_menu), self.scratch_btn)  # no sidebar: icon lives in the toolbar
         else:
             for w, k in ((self.ess_wrap, 0), (self.divider, 0), (self.newtab, 0), (self.group_wrap, 0), (self.tabs, 1)):
                 self.side_lay.addWidget(w, k)
@@ -5449,10 +6793,10 @@ class Browser(QMainWindow):
                 self.side.setFixedWidth(tw)
                 self.side.hide()
                 self.edge.setVisible(bool(st.get("autohide")))
-        self.btn_side.setVisible(not self.horiz)
         self.player.set_compact(self.compact)
         self.scratch_btn.set_mode(self.compact, self.horiz)
         self.scratch_btn.show()
+        self.tb_ed.apply()  # sidebar button / scratchpad icon come and go with the layout
         self.place_grip()
         for i in range(self.tabs.count()):
             item = self.tabs.item(i)
@@ -5988,6 +7332,8 @@ class Browser(QMainWindow):
         self.scratch.setVisible(bool(self.scratch.want and not on))  # page fullscreen: tuck the drawer away
         self.strip.setVisible(self.horiz and not on)
         self.edge.setVisible(not on and bool(self.settings.get("autohide")) and not self.sidebar_wanted and not self.horiz)
+        if on:
+            self.tb_ed.stop()
         self.toolbar.setVisible(not on)
         m = 0 if on else 8
         self.centralWidget().layout().setContentsMargins(m, m, m, m)
@@ -6001,6 +7347,14 @@ class Browser(QMainWindow):
         name = d.downloadFileName()
         self.toast(f"Downloading {name}…")
         d.isFinishedChanged.connect(lambda: self.toast(f"Downloaded {name}"))
+        if name.lower().endswith((".xpi", ".crx")):  # an extension: offer to add it once it has arrived
+            asked = []
+
+            def offer():
+                if d.isFinished() and not asked and d.state() == d.DownloadState.DownloadCompleted:
+                    asked.append(1)
+                    self.offer_extension(str(Path(d.downloadDirectory()) / d.downloadFileName()), name)
+            d.isFinishedChanged.connect(offer)
 
     def print_pdf(self):
         t = self.cur()
@@ -6102,6 +7456,8 @@ class Browser(QMainWindow):
             self.add_top_site()
         elif url.host() == "top-remove":
             self.remove_top_site(parse_qs(url.query()).get("h", [""])[0])
+        elif url.host().startswith("ext-"):
+            self.ext_action(url)
         elif url.host() == "clear-history":
             self.history = []
             jsave("history.json", [])
@@ -6113,6 +7469,98 @@ class Browser(QMainWindow):
             jsave("bookmarks.json", self.bookmarks)
             self.refresh_completer()
             self.open_bookmarks()
+
+    # ----- extensions -----
+    def show_ext_menu(self):
+        hub = self.extensions
+        m = QMenu(self)
+        t = self.cur()
+        page = t.url().toString() if t is not None else ""
+        try:
+            on_store = resolve_ext_url(page)[0] in ("crx", "amo")  # a Chrome Web Store or Firefox Add-ons page
+        except ExtError:
+            on_store = False
+        if on_store:
+            m.addAction("Add this page's extension to Fjord", lambda: hub.add_url(page))
+            m.addSeparator()
+        if not hub.available:
+            m.addAction("Extensions need PyQt6-WebEngine 6.10 or newer", self.open_extensions)
+            m.addSeparator()
+        for r in hub.records:
+            name, on = Path(r["dir"]).name, r.get("enabled", True)
+            ico = QIcon(str(Path(r["dir"]) / r["icon"])) if r.get("icon") else QIcon()
+            sub = m.addMenu(ico, r["name"])
+            sub.addAction("Open", lambda _c=False, n=name: hub.popup(n)).setEnabled(on)
+            if r.get("options"):
+                sub.addAction("Settings", lambda _c=False, n=name: hub.options(n)).setEnabled(on)
+            sub.addAction("Turn off" if on else "Turn on", lambda _c=False, n=name: hub.toggle(n))
+            sub.addAction("Remove", lambda _c=False, n=name: self.confirm_remove_ext(n))
+        if hub.records:
+            m.addSeparator()
+        m.addAction("Add or manage extensions…", self.open_extensions)
+        m.exec(self.btn_ext.mapToGlobal(self.btn_ext.rect().bottomLeft()))
+
+    def open_extensions(self, keep_scroll=False):
+        t = self.cur()
+        page = extensions_html(self)
+        if keep_scroll and t is not None and t.url().scheme() == "fjord" and t.url().host() == "extensions":
+            def go(y):
+                def restore(_ok):
+                    t.loadFinished.disconnect(restore)
+                    t.page().runJavaScript("window.scrollTo(0,%d)" % int(y or 0))
+                t.loadFinished.connect(restore)
+                t.setHtml(page, QUrl("fjord://extensions"))
+            t.page().runJavaScript("window.scrollY", go)
+        else:
+            self.show_page("extensions", page)
+
+    def on_ext_changed(self):
+        t = self.cur() if hasattr(self, "stack") else None
+        if t is not None and t.url().scheme() == "fjord" and t.url().host() == "extensions":
+            QTimer.singleShot(0, lambda: self.open_extensions(keep_scroll=True))
+
+    def ext_action(self, url):
+        q = parse_qs(url.query(QUrl.ComponentFormattingOption.FullyEncoded))
+        g = lambda k: q.get(k, [""])[0]
+        h, hub = url.host(), self.extensions
+        if h == "ext-open":
+            self.open_extensions()
+        elif h == "ext-add":
+            self.pick_extension(g("m"))
+        elif h == "ext-url":
+            hub.add_url(g("u"))
+        elif h == "ext-toggle":
+            hub.toggle(g("d"))
+        elif h == "ext-remove":
+            self.confirm_remove_ext(g("d"))
+        elif h == "ext-popup":
+            hub.popup(g("d"))
+        elif h == "ext-options":
+            hub.options(g("d"))
+
+    def pick_extension(self, mode):
+        mac = sys.platform == "darwin"
+        if mode == "file":
+            path, _ = QFileDialog.getOpenFileName(self, "Add extension", str(Path.home() / "Downloads"),
+                                                  "Extensions (*.crx *.xpi *.zip *.ipa);;All files (*)")
+        else:
+            opts = QFileDialog.Option.ShowDirsOnly
+            if mac:  # the native Mac dialog won't pick an .app, and that is where Safari extensions live
+                opts |= QFileDialog.Option.DontUseNativeDialog
+            path = QFileDialog.getExistingDirectory(self, "Pick an extension folder or Safari app",
+                                                    "/Applications" if mac else str(Path.home()), opts)
+        if path:
+            self.extensions.add_path(path)
+
+    def confirm_remove_ext(self, name):
+        rec = self.extensions.record(name)
+        if rec and QMessageBox.question(self, "Fjord", 'Remove "%s"? Its saved data goes with it.' % rec["name"]) \
+                == QMessageBox.StandardButton.Yes:
+            self.extensions.remove(name)
+
+    def offer_extension(self, path, name):
+        if QMessageBox.question(self, "Fjord", 'Add "%s" as an extension?' % name) == QMessageBox.StandardButton.Yes:
+            self.extensions.add_path(path)
 
     # ----- menu -----
     def set_engine(self, name):
@@ -6545,6 +7993,11 @@ class Browser(QMainWindow):
         jsave("essentials.json", self.essentials)
         self.rebuild_essentials()
 
+    def toolbar_menu(self, pos):
+        m = QMenu(self)
+        m.addAction("Customize toolbar…", self.tb_ed.start)
+        m.exec(self.toolbar.mapToGlobal(pos))
+
     def show_menu(self):
         m = QMenu(self)
         m.addAction("New tab\tCtrl+T", lambda: self.new_tab(focus_address=True))
@@ -6553,6 +8006,7 @@ class Browser(QMainWindow):
         m.addSeparator()
         m.addAction("Bookmarks\tCtrl+Shift+O", self.open_bookmarks)
         m.addAction("History\tCtrl+H", self.open_history)
+        m.addAction("Extensions", self.open_extensions)
         m.addAction("Open downloads folder", lambda: QDesktopServices.openUrl(
             QUrl.fromLocalFile(str(Path.home() / "Downloads"))))
         m.addSeparator()
@@ -6593,6 +8047,7 @@ class Browser(QMainWindow):
             paused = site in self.adblock.allow
             m.addAction(("Resume" if paused else "Pause") + " ad blocking on " + site,
                         lambda: self.pause_site(site, not paused))
+        m.addAction("Customize toolbar…", self.tb_ed.start)
         m.addAction("VPN / Proxy…", lambda: self.open_settings())
         m.addAction("Settings\tCtrl+,", lambda: self.open_settings())
         m.addAction("Quit", self.close)
@@ -6651,9 +8106,19 @@ class Browser(QMainWindow):
         super().closeEvent(e)
 
 
+def resource_path(name):
+    """Find a bundled file both when run as a script and when packaged by PyInstaller."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
 def main():
+    if sys.platform == "win32":
+        import ctypes  # gives Fjord its own taskbar identity so the icon shows instead of python.exe's
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("fjord.browser.1")
     app = QApplication(sys.argv)
     app.setApplicationName("Fjord")
+    app.setWindowIcon(QIcon(resource_path("fjord.ico")))
     DATA_DIR.mkdir(exist_ok=True)
     load_custom_fonts()
     apply_font(app, pick_font(jload("settings.json", {}).get("font")))
