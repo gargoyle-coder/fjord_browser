@@ -1,6 +1,6 @@
 name: Feature Request
 description: Request for a feature to be added.
-title: "[Bug]: "
+title: "[Feature]: "
 labels: ["feature", "triage"]
 type: feature
 body:
