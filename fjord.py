@@ -10,15 +10,20 @@ Ctrl+D bookmark · Ctrl+Shift+O bookmarks · Ctrl+H history · Ctrl+F find
 Ctrl+1..9 jump to tab · Ctrl+Tab cycle · Ctrl+B sidebar · Ctrl+P save as PDF
 Ctrl+= / - / 0 zoom · Alt+←/→ back/forward · F11 fullscreen · ⋯ menu for more
 Drag the sidebar's right edge to resize it (double-click resets) · right-click the media player for options
-Scratchpad (Ctrl+Shift+S): drop images, files, text or links on the sidebar to keep a copy, then copy or save them again
+Scratchpad (Ctrl+Shift+S): drag images, files, text or links toward the window and it pops open to catch them; copy or save them again later
 Sticky notes: click the little note button at the bottom right of any site to pin a note there (saved in ~/.fjord_browser/notes.json)
 Extensions: the puzzle-piece button in the toolbar (or the ⋯ menu > Extensions) adds Chrome, Firefox and Safari extensions
+Welcome tour: runs on first launch (import from another browser, accent colour, layout, speed, privacy, tools); replay it from ⋯ menu > Welcome tour…
+Updates: ⋯ menu > Check for updates (also checks on launch; set GITHUB_REPO and APP_VERSION below)
 Toolbar: right-click it (or ⋯ menu > Customize toolbar…), then drag buttons to rearrange, remove or add them
+Interface style: ⋯ menu > View & appearance > Interface style (or right-click the toolbar, or Settings > Window):
+    Default (Fjord as it is), macOS (Safari-like liquid glass + motion + macOS buttons) or Windows (Windows 11 look + Windows buttons)
 """
 import base64
 import colorsys
 import datetime
 import gc
+import hashlib
 import html
 import io
 import ipaddress
@@ -27,9 +32,11 @@ import math
 import mimetypes
 import os
 import posixpath
+import plistlib
 import re
 import secrets
 import shutil
+import sqlite3
 import struct
 import sys
 import tempfile
@@ -37,6 +44,7 @@ import threading
 import time
 import urllib.request
 import zipfile
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, quote_plus, unquote, urlparse
@@ -78,9 +86,9 @@ def _early_flags():
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", _early_flags())
 
 from PyQt6.QtCore import (QEasingCurve, QEvent, QPropertyAnimation, QRectF, QSize, QStringListModel, Qt,
-                          QMimeData, QObject, QPoint, QPointF, QProcess, QTimer, QUrl, QVariantAnimation, pyqtSignal)
+                          QMimeData, QObject, QPoint, QPointF, QProcess, QProcessEnvironment, QTimer, QUrl, QVariantAnimation, pyqtSignal)
 from PyQt6.QtGui import (QColor, QCursor, QDesktopServices, QFont, QFontDatabase, QFontMetrics, QIcon, QKeySequence,
-                         QDrag, QImage, QImageReader, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QShortcut, QTextOption)
+                         QBrush, QConicalGradient, QDrag, QImage, QImageReader, QLinearGradient, QRadialGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QShortcut, QTextOption)
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PyQt6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile, QWebEngineScript, QWebEngineSettings,
                                    QWebEngineUrlRequestInfo, QWebEngineUrlRequestInterceptor)
@@ -96,8 +104,14 @@ except Exception:  # QtSvg missing: fall back to downloaded logos / letter badge
 from PyQt6.QtWidgets import (
     QApplication, QBoxLayout, QCompleter, QFileDialog, QFrame, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QListView, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QInputDialog, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
-    QScrollArea, QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QToolButton, QVBoxLayout, QWidget,
+    QScrollArea, QStackedWidget, QStyle, QAbstractButton, QColorDialog, QGraphicsEffect, QStyledItemDelegate, QStyleOptionViewItem, QToolButton, QVBoxLayout, QWidget,
 )
+
+# ----- auto-update -----
+# Bump APP_VERSION on every release so it matches the GitHub release tag (tag "v1.2.0" or "1.2.0" -> "1.2.0").
+APP_VERSION = "0.1.0"
+GITHUB_REPO = "gargoyle-coder/fjord_browser"      # <- change to "owner/repo" of your GitHub repository
+UPDATE_ASSET = "fjord.py"                # name of the file attached to each release (falls back to the file at the release tag)
 
 DATA_DIR = Path.home() / ".fjord_browser"
 START_URL = QUrl("fjord://start")
@@ -177,6 +191,100 @@ def _rgb(hexcol):
     return int(hexcol[1:3], 16), int(hexcol[3:5], 16), int(hexcol[5:7], 16)
 
 
+# ----- interface style -----
+# "default" is Fjord's own look. "mac" is Safari-like: liquid-glass surfaces, pill shapes, extra motion, macOS traffic lights.
+# "windows" is a flat Windows 11 (Fluent) look in neutral greys with the Windows caption buttons.
+UI_MODES = (("default", "Default"), ("mac", "macOS"), ("windows", "Windows"))
+UI_LABELS = {"default": "Default", "mac": "macOS  (Safari-like liquid glass)", "windows": "Windows  (Windows 11 look)"}
+UI = {"mode": "default", "radius": 100, "bright": 100, "transp": 50}
+# User-tunable look (Settings > Glass & corners): settings key -> (UI key, min, max, default)
+TUNE = {"glass_bright": ("bright", 0, 200, 100), "glass_transp": ("transp", 0, 100, 50)}
+
+
+def load_ui_tuning(st):
+    """Read the corner-radius / glass-brightness / glass-transparency sliders from the settings dict."""
+    st.pop("ui_radius", None)  # the corner-radius slider was removed; corners stay at the default
+    for key, (name, lo, hi, dflt) in TUNE.items():
+        try:
+            val = int(st.get(key, dflt))
+        except (TypeError, ValueError):
+            val = dflt
+        UI[name] = max(lo, min(hi, val))
+
+
+def rr(r):
+    """A hard-coded corner radius, scaled by the corner-radius slider."""
+    return float(r) * UI["radius"] / 100.0
+
+
+def glass_rgba(alpha):
+    """A glass overlay colour. Brightness below 100% smokes the glass (darker tint), above 100% makes it stronger and whiter;
+    transparency 0..100% runs from frosted (x2 opacity) through the original look (50%) to fully clear."""
+    b = UI["bright"] / 100.0
+    lvl = int(min(255, 255 * b))
+    mul = max(1.0, b) * 2.0 * (100 - UI["transp"]) / 100.0
+    return QColor(lvl, lvl, lvl, int(max(0, min(255, alpha * mul))))
+
+
+_RADIUS_RE = re.compile(r"(border(?:-(?:top|bottom)-(?:left|right))?-radius)(\s*:\s*)([^;}\"']+)", re.I)
+_WHITE_RE = re.compile(r"rgba\(\s*255\s*,\s*255\s*,\s*255\s*,\s*(0?\.\d+)\s*\)")
+
+
+def tune_css(css):
+    """Apply the corner-radius and glass sliders to a stylesheet (Qt QSS or web CSS)."""
+    m = UI["radius"] / 100.0
+    if UI["radius"] != 100:
+        def px(t):
+            v = float(t.group(1))
+            if v >= 99:  # "pill" values stay pills until the slider gets low
+                v = 99.0 if m >= 0.5 else 32.0 * m
+            else:
+                v *= m
+            return "%gpx" % round(v, 1)
+        css = _RADIUS_RE.sub(lambda g: g.group(1) + g.group(2) + re.sub(r"(\d+(?:\.\d+)?)px", px, g.group(3)), css)
+    if UI["bright"] != 100 or UI["transp"] != 50:
+        b = UI["bright"] / 100.0
+        lvl = int(min(255, 255 * b))
+        mul = max(1.0, b) * 2.0 * (100 - UI["transp"]) / 100.0
+
+        def white(g):
+            a = float(g.group(1))
+            if a > 0.3:  # stronger values are text colours, leave them readable
+                return g.group(0)
+            return "rgba(%d,%d,%d,%.3f)" % (lvl, lvl, lvl, min(1.0, a * mul))
+        css = _WHITE_RE.sub(white, css)
+    return css
+PAGE_RADII = {"default": 16, "mac": 18, "windows": 8}
+FRAME_MARGINS = {"default": 8, "mac": 10, "windows": 8}
+# Windows 11 dark greys that replace Fjord's blue-tinted surfaces while the Windows style is on
+WIN_SURFACES = {"#0b141d": "#1b1b1b", "#101b26": "#242424", "#172431": "#2c2c2c", "#1c2b3a": "#313131",
+                "#132029": "#2b2b2b", "#243546": "#3a3a3a", "#1f2e3d": "#333333", "#2c4156": "#3d3d3d",
+                "#2b3f54": "#454545", "#b5c6d4": "#c5c5c5", "#c3d3e0": "#d2d2d2", "#8ea3b4": "#9e9e9e",
+                "#7d93a5": "#8c8c8c", "#3f5163": "#5c5c5c"}
+
+
+def valid_ui_mode(m):
+    return m if m in dict(UI_MODES) else "default"
+
+
+def page_radius():
+    return int(round(rr(PAGE_RADII[UI["mode"]])))
+
+
+def frame_margin():
+    return FRAME_MARGINS[UI["mode"]]
+
+
+def shape_radius(base, rect):
+    """Corner radius for a control: pill-shaped in macOS style, squarer in Windows style, unchanged otherwise."""
+    half = min(rect.width(), rect.height()) / 2.0
+    if UI["mode"] == "mac":
+        return min(half, half * UI["radius"] / 100.0)
+    if UI["mode"] == "windows":
+        return min(half, rr(min(float(base), 5.0)))
+    return min(half, rr(base))
+
+
 SURFACE_HEX = ("#0b141d", "#101b26", "#172431", "#1c2b3a", "#132029", "#243546", "#1f2e3d", "#2c4156", "#2b3f54",
                "#c5e6fa", "#b5c6d4", "#c3d3e0", "#8ea3b4", "#7d93a5", "#3f5163")
 
@@ -189,12 +297,14 @@ def themed(css):
         for hx in SURFACE_HEX:
             _h, sat, val = colorsys.rgb_to_hsv(*(c / 255.0 for c in _rgb(hx)))
             mapping[hx] = "#%02x%02x%02x" % tuple(int(round(c * 255)) for c in colorsys.hsv_to_rgb(hue, sat, val))
+    if UI["mode"] == "windows":
+        mapping.update(WIN_SURFACES)
     css = re.sub(r"#[0-9a-fA-F]{6}\b", lambda m: mapping.get(m.group(0).lower(), m.group(0)), css)
     (r1, g1, b1), (r2, g2, b2) = _rgb(ACCENT["main"]), _rgb(ACCENT["alt"])
     for x, y in (("79,176,232", "%d,%d,%d" % (r1, g1, b1)), ("79, 176, 232", "%d, %d, %d" % (r1, g1, b1)),
                  ("126,240,208", "%d,%d,%d" % (r2, g2, b2)), ("126, 240, 208", "%d, %d, %d" % (r2, g2, b2))):
         css = css.replace(x, y)
-    return css
+    return tune_css(css)
 
 
 def accent_color(alpha=255):
@@ -254,7 +364,7 @@ def apply_font(app, family):
     f.setWeight(QFont.Weight.Normal)
     f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.2)
     app.setFont(f)
-    app.setStyleSheet(themed(QSS))
+    app.setStyleSheet(themed(app_qss()))
 
 
 def base_css():
@@ -591,6 +701,7 @@ h1 a{{font-size:13px;opacity:.6;padding:6px 14px;border-radius:99px;background:r
 b{{display:block;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 small{{display:block;opacity:.45;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .x{{padding:10px 16px;opacity:.5}} .x:hover{{opacity:1}} .e{{opacity:.5}}
+.fh{{font-size:11px;letter-spacing:.14em;text-transform:uppercase;opacity:.45;margin:26px 14px 6px}}
 @keyframes up{{from{{opacity:0;transform:translateY(10px)}}to{{opacity:1;transform:none}}}}
 main{{animation:up .5s cubic-bezier(.2,.7,.2,1) both}} .r{{transition:background .25s}} h1{{font-weight:200}}
 </style><main><h1>{html.escape(title)}{action_html}</h1>{rows or '<p class=e>Nothing here yet.</p>'}</main>"""
@@ -627,6 +738,11 @@ button{padding:9px 22px;border:none;border-radius:99px;background:linear-gradien
 input[type=color]{background:none;border:none;cursor:pointer}
 details{padding:0 0 6px} summary{cursor:pointer;padding:14px 0 10px;opacity:.65;font-size:13px;list-style:none}
 summary::-webkit-details-marker{display:none} summary:hover{opacity:1}
+.sl{flex:none;display:flex;align-items:center;gap:12px} .sl input{width:190px;accent-color:#4fb0e8;cursor:pointer}
+.sl .pc{font-size:12px;opacity:.8;min-width:62px;display:flex;align-items:center;justify-content:flex-end;gap:2px}
+.sl .pv{width:44px;min-width:0;flex:none;padding:3px 4px;text-align:right;font:inherit;color:inherit;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);border-radius:8px;outline:none;-moz-appearance:textfield}
+.sl .pv:focus{border-color:#4fb0e8}
+.sl .pv::-webkit-inner-spin-button,.sl .pv::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
 .tag{flex:none;padding:4px 12px;border-radius:99px;font-size:12px;background:rgba(79,176,232,.3)}
 """
 
@@ -651,9 +767,30 @@ def settings_html(b):
         return ("<a class=\"chip%s\" style=\"font-family:'%s',sans-serif\" href=\"%s\">%s</a>"
                 % (" on" if n == CUR_FONT["family"] else "", e(n), L("font", n), e(n)))
 
+    def slider(key, title, desc):
+        _n, lo, hi, dflt = TUNE[key]
+        cur = int(st.get(key, dflt)) if str(st.get(key, dflt)).lstrip("-").isdecimal() else dflt
+        cur = max(lo, min(hi, cur))
+        return ('<div class=row><div>%s<small>%s</small></div><div class=sl><input type=range min=%d max=%d step=1 value=%d '
+                'oninput="this.parentNode.querySelector(\'.pv\').value=this.value" '
+                'onchange="location.href=\'fjord://set?k=%s&amp;v=\'+this.value">'
+                '<span class=pc><input class=pv type=number min=%d max=%d step=1 value=%d '
+                'oninput="var r=this.parentNode.parentNode.querySelector(\'[type=range]\');if(this.value!==\'\')r.value=this.value" '
+                'onchange="var v=Math.max(%d,Math.min(%d,Math.round(Number(this.value))));if(isNaN(v))v=%d;'
+                'location.href=\'fjord://set?k=%s&amp;v=\'+v">%%</span></div></div>'
+                % (title, desc, lo, hi, cur, key, lo, hi, cur, lo, hi, cur, key))
+    tune_rows = (slider("glass_bright", "Glass brightness", "Below 100% the glass turns smoky and dark, above it gets brighter and whiter. Applies to glass and translucent surfaces")
+                 + slider("glass_transp", "Glass transparency", "0% is frosted and solid-looking, 50% is the original look, 100% is fully clear")
+                 + '<div class=row><div>Reset glass<small>Back to the original brightness and transparency</small></div>'
+                   '<a class=x href="fjord://set?k=ui_reset&amp;v=1">Reset</a></div>')
     layout_row = ('<div class=row><div>Tab layout<small>Vertical tabs in a sidebar, or a horizontal tab bar on top</small></div>'
                   + seg("layout", [("vertical", "Vertical"), ("horizontal", "Horizontal")], st.get("layout", "vertical")) + "</div>")
-    win_row = ('<div class=row><div>Window buttons<small>Minimise, zoom and close buttons next to the menu, in Windows or macOS style</small></div>'
+    style_row = ('<div class=row><div>Interface style<small>Default is Fjord as it is. macOS is Safari-like, with liquid-glass surfaces, '
+                 'extra animation and macOS window buttons. Windows is a flat Windows 11 look with Windows window buttons</small></div>'
+                 + seg("ui_style", list(UI_MODES), UI["mode"]) + "</div>")
+    win_note = ("Minimise, zoom and close buttons next to the menu, in Windows or macOS style" if UI["mode"] == "default"
+                else "Set by the interface style above. Pick Default there to choose these separately")
+    win_row = ('<div class=row><div>Window buttons<small>' + win_note + '</small></div>'
                + seg("winbtns", [("windows", "Windows"), ("mac", "macOS")], st.get("winbtns", default_winbtns())) + "</div>")
     ess = "".join(
         '<div class=row><div>%s<small>%s</small></div><a class=x href="fjord://ess-remove?h=%s">Remove</a></div>'
@@ -787,15 +924,22 @@ def settings_html(b):
               + str(int(bgc.get("dim", 30))) + '" style="flex:none;width:160px" onchange="this.form.submit()"></form>'
               '<div class=row><div>Reset background<small>Go back to the default Fjord look</small></div>'
               '<a class=x href="' + bl(kind="default") + '">Reset</a></div></div>')
+    has_accent = isinstance(st.get("accent"), dict)
+    tour_sec = ("<h2>Welcome tour</h2><div class=card>"
+                "<div class=row><div>Replay the tour<small>Import, accent colour, layout and a run through the features</small></div>"
+                '<a class=x href="fjord://set?k=tour&v=1">Start</a></div>'
+                "<div class=row><div>Accent colour<small>" + ("Custom accent chosen in the tour" if has_accent
+                                                              else "Follows your new tab background") + "</small></div>"
+                + ('<a class=x href="fjord://set?k=accent_reset&v=1">Reset</a>' if has_accent else "") + "</div></div>")
     return ("<!doctype html><meta charset=utf-8><meta name=color-scheme content=dark><title>Settings</title><style>" + base_css() + themed(SETTINGS_CSS) + "</style>"
             "<main><h1>Settings</h1><h2>Sidebar</h2><div class=card>" + layout_row
             + sw("compact", "Compact mode", "Shrink the vertical sidebar to a slim bar that shows only site icons")
             + sw("autohide", "Auto-hide sidebar", "Hide the sidebar until you move the mouse to the left edge")
             + sw("visualizer", "Media visualiser", "Show animated audio bars in the sidebar media player")
-            + "</div><h2>Window</h2><div class=card>" + win_row + "</div><h2>Essentials</h2><div class=card>"
+            + "</div><h2>Window</h2><div class=card>" + style_row + win_row + "</div><h2>Glass</h2><div class=card>" + tune_rows + "</div><h2>Essentials</h2><div class=card>"
             + sw("ess_startup", "Keep Essentials loaded", "Open your Essentials in the background at startup so they are always ready", True)
             + ess + "</div>" + privacy + vpn + ext_sec + "<h2>Search</h2><div class=card>" + engine_row
-            + "</div>" + greet_sec + bg_sec + "<h2>Font</h2><div class=card><div class=chips>" + "".join(chip(n) for n in installed_fonts())
+            + "</div>" + greet_sec + bg_sec + tour_sec + "<h2>Font</h2><div class=card><div class=chips>" + "".join(chip(n) for n in installed_fonts())
             + "</div><div class=hint>Want more? Drop .ttf or .otf files into <b>" + e(str(DATA_DIR / "fonts"))
             + "</b> and restart Fjord.</div></div></main>")
 
@@ -846,7 +990,7 @@ QToolButton#newgroup { font-size: 11px; color: #8ea3b4; border: 1px solid transp
 QToolButton#newgroup:hover { color: #fff; }
 QMessageBox QPushButton { background: #1f2e3d; border: none; border-radius: 10px; padding: 7px 18px; min-width: 64px; }
 QMessageBox QPushButton:hover { background: #2c4156; }
-QMenu { background: #132029; border: 1px solid #243546; border-radius: 12px; padding: 6px; }
+QMenu { background: #132029; border: 1px solid #243546; border-radius: 12px; padding: 6px; menu-scrollable: 1; }
 QMenu::item { padding: 7px 22px; border-radius: 8px; }
 QMenu::item:selected { background: rgba(79,176,232,0.25); }
 QMenu::separator { height: 1px; background: #243546; margin: 5px 8px; }
@@ -871,6 +1015,79 @@ QToolButton#scratchclear:hover { color: #fff; background: rgba(255,255,255,0.07)
 POPUP_QSS = ("QListView{background:#172431;border:1px solid #2b3f54;border-radius:10px;"
              "outline:none;padding:4px}QListView::item{padding:6px 10px;border-radius:6px}"
              "QListView::item:selected{background:rgba(79,176,232,.3)}")
+
+# Extra rules laid over QSS for the macOS and Windows interface styles (later rules win over the ones above).
+QSS_MAC = """
+#sidebar { background: rgba(255,255,255,0.035); border-radius: 20px; }
+QListWidget::item { border-radius: 12px; margin: 2px 0; }
+QListWidget::item:hover { background: rgba(255,255,255,0.06); }
+QListWidget::item:selected { background: rgba(255,255,255,0.09); }
+QToolButton { border-radius: 16px; }
+QToolButton#engine, QToolButton#tbicon { border-radius: 18px; }
+QToolButton#essential { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.10); border-radius: 14px; }
+QToolButton#essential:checked { background: rgba(79,176,232,0.22); border: 1px solid rgba(79,176,232,0.60); }
+QPushButton#newtab { background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.10); border-radius: 16px; padding: 10px; color: #e4edf3; }
+QPushButton#newtab:hover { background: rgba(255,255,255,0.12); }
+QLineEdit { background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.09); border-radius: 18px; padding: 8px 16px; }
+QLineEdit:focus { background: rgba(255,255,255,0.10); border: 1px solid rgba(79,176,232,0.45); }
+QFrame#tbpanel, QFrame#scratch { border-radius: 20px; border: 1px solid rgba(255,255,255,0.12); }
+QFrame#media { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.09); border-radius: 16px; }
+QFrame#scard { border-radius: 14px; }
+QMenu { border: 1px solid rgba(255,255,255,0.14); border-radius: 14px; padding: 6px; }
+QMenu::item { padding: 7px 20px; border-radius: 9px; }
+QMenu::item:selected { background: rgba(255,255,255,0.12); }
+QDialog QPushButton, QMessageBox QPushButton { border-radius: 14px; }
+QPushButton#tbdone, QPushButton#tbreset { border-radius: 16px; }
+QToolButton#newgroup { border-radius: 14px; }
+QToolButton#miniclose { border-radius: 8px; }
+"""
+QSS_WIN = """
+#sidebar { border-radius: 8px; border: 1px solid rgba(255,255,255,0.05); }
+QListWidget::item { border-radius: 5px; margin: 1px 0; }
+QListWidget::item:hover { background: rgba(255,255,255,0.055); }
+QListWidget::item:selected { background: rgba(255,255,255,0.095); }
+QToolButton { border-radius: 5px; }
+QToolButton#engine, QToolButton#tbicon { border-radius: 5px; }
+QToolButton#essential { background: rgba(255,255,255,0.055); border: 1px solid rgba(255,255,255,0.05); border-radius: 6px; }
+QToolButton#essential:checked { background: rgba(255,255,255,0.10); border: 1px solid rgba(79,176,232,0.80); }
+QPushButton#newtab { background: #4fb0e8; border: none; border-radius: 5px; padding: 9px; color: #0b141d; }
+QPushButton#newtab:hover { background: rgba(79,176,232,0.86); }
+QLineEdit { background: #172431; border: 1px solid rgba(255,255,255,0.07); border-radius: 5px; padding: 6px 12px; selection-background-color: #4fb0e8; }
+QLineEdit:focus { background: #0b141d; border: 1px solid rgba(255,255,255,0.12); }
+QFrame#tbpanel, QFrame#scratch { border-radius: 8px; }
+QFrame#media { border-radius: 8px; }
+QFrame#scard { border-radius: 6px; }
+QMenu { border-radius: 8px; padding: 4px; }
+QMenu::item { padding: 6px 20px; border-radius: 4px; margin: 1px 2px; }
+QMenu::item:selected { background: rgba(255,255,255,0.08); }
+QDialog QPushButton, QMessageBox QPushButton { border-radius: 5px; }
+QPushButton#tbdone { background: #4fb0e8; color: #0b141d; border-radius: 5px; }
+QPushButton#tbdone:hover { background: rgba(79,176,232,0.86); }
+QPushButton#tbreset, QToolButton#newgroup { border-radius: 5px; }
+QToolButton#miniclose { border-radius: 4px; }
+QProgressBar::chunk { background: #4fb0e8; }
+"""
+POPUP_MAC = ("QListView{border-radius:14px;padding:6px;border:1px solid rgba(255,255,255,0.14)}"
+             "QListView::item{border-radius:9px;padding:7px 12px}")
+POPUP_WIN = ("QListView{border-radius:8px;padding:4px}QListView::item{border-radius:4px;padding:6px 10px}"
+             "QListView::item:selected{background:rgba(255,255,255,0.09)}")
+
+
+QSS_HORIZ = """
+QListWidget[horiz="true"]::item { margin: 4px 1px 0 1px; border-radius: 0;
+    border-top-left-radius: 9px; border-top-right-radius: 9px;
+    border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+QListWidget[horiz="true"]::item:hover { background: rgba(255,255,255,0.06); }
+QListWidget[horiz="true"]::item:selected { background: rgba(255,255,255,0.12); }
+"""
+
+
+def app_qss():
+    return QSS + {"mac": QSS_MAC, "windows": QSS_WIN}.get(UI["mode"], "") + QSS_HORIZ
+
+
+def popup_qss():
+    return POPUP_QSS + {"mac": POPUP_MAC, "windows": POPUP_WIN}.get(UI["mode"], "")
 
 
 def trim_memory():
@@ -1400,6 +1617,562 @@ class QuietServer(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         pass  # never print tracebacks for dropped connections
+
+
+def _ver_tuple(v):
+    nums = [int(n) for n in re.findall(r"\d+", str(v or ""))[:4]]
+    return tuple(nums + [0] * (4 - len(nums)))
+
+
+def _app_path():
+    """The file that gets replaced on update: fjord.py when run as a script, the .exe when packaged."""
+    return Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
+
+
+def cleanup_old_update():
+    """Remove the previous exe / backup left behind by an update."""
+    try:
+        old = _app_path().with_name(_app_path().name + ".old")
+        if old.exists():
+            old.unlink()
+    except OSError:
+        pass
+
+
+class Updater(QObject):
+    """Checks GitHub for a newer release, downloads it and swaps it in. Runs in a worker thread; results arrive as signals."""
+    found = pyqtSignal(dict)      # a newer release exists
+    uptodate = pyqtSignal()
+    failed = pyqtSignal(str)
+    installed = pyqtSignal(str)   # new version, ready to restart into
+
+    def _get(self, url, timeout=20):
+        req = urllib.request.Request(url, headers={"User-Agent": "FjordBrowser/" + APP_VERSION,
+                                                   "Accept": "application/vnd.github+json"})
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    def check(self):
+        threading.Thread(target=self._check, daemon=True).start()
+
+    def _check(self):
+        try:
+            if "/" not in GITHUB_REPO or GITHUB_REPO.startswith("your-username"):
+                raise RuntimeError("Set GITHUB_REPO at the top of fjord.py to your repository (owner/repo).")
+            with self._get("https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO) as r:
+                rel = json.loads(r.read().decode("utf-8"))
+            tag = str(rel.get("tag_name") or "")
+            if _ver_tuple(tag) <= _ver_tuple(APP_VERSION):
+                self.uptodate.emit()
+                return
+            assets = rel.get("assets") or []
+            frozen = getattr(sys, "frozen", False)
+            pick = None
+            if frozen:  # packaged build: needs an .exe asset (Windows one-file build)
+                pick = next((a for a in assets if str(a.get("name", "")).lower().endswith(".exe")), None)
+                if not pick or sys.platform != "win32":
+                    raise RuntimeError("v%s is out, but this build can't self-update. Download it from the releases page." % tag.lstrip("vV"))
+            else:
+                pick = next((a for a in assets if a.get("name") == UPDATE_ASSET), None)
+            if pick:
+                url, digest, name = pick.get("browser_download_url"), str(pick.get("digest") or ""), pick["name"]
+            else:  # no asset attached: take the source file straight from the tagged commit
+                url = "https://raw.githubusercontent.com/%s/%s/%s" % (GITHUB_REPO, quote(tag), UPDATE_ASSET)
+                digest, name = "", UPDATE_ASSET
+            self.found.emit({"version": tag.lstrip("vV"), "url": url, "digest": digest, "name": name,
+                             "notes": str(rel.get("body") or "").strip()[:900], "page": rel.get("html_url", "")})
+        except Exception as ex:
+            self.failed.emit(str(ex) or ex.__class__.__name__)
+
+    def install(self, info):
+        threading.Thread(target=self._install, args=(info,), daemon=True).start()
+
+    def _install(self, info):
+        tmp = None
+        try:
+            target = _app_path()
+            tmp = target.with_name(target.name + ".new")
+            h, size = hashlib.sha256(), 0
+            with self._get(info["url"], timeout=60) as r, open(tmp, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > 400 * 1024 * 1024:
+                        raise RuntimeError("Download is unexpectedly large.")
+                    h.update(chunk)
+                    f.write(chunk)
+            if size < 1024:
+                raise RuntimeError("Downloaded file is empty.")
+            want = info.get("digest", "")
+            if want.startswith("sha256:") and want[7:].lower() != h.hexdigest():
+                raise RuntimeError("Checksum mismatch, update cancelled.")
+            if getattr(sys, "frozen", False):
+                old = target.with_name(target.name + ".old")
+                if old.exists():
+                    old.unlink()
+                os.replace(target, old)  # a running .exe can be renamed, just not overwritten
+                try:
+                    os.replace(tmp, target)
+                except Exception:
+                    os.replace(old, target)
+                    raise
+            else:
+                code = tmp.read_bytes()
+                compile(code, UPDATE_ASSET, "exec")  # never install a file that doesn't even parse
+                if b"def main" not in code:
+                    raise RuntimeError("Downloaded file doesn't look like Fjord.")
+                shutil.copy2(target, target.with_name(target.name + ".bak"))
+                os.replace(tmp, target)
+            self.installed.emit(info["version"])
+        except Exception as ex:
+            try:
+                if tmp and tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            self.failed.emit("Update failed: %s" % (str(ex) or ex.__class__.__name__))
+
+
+# ----- importing bookmarks & history from other browsers -----
+def _is_web(u):
+    return isinstance(u, str) and u.lower().startswith(("http://", "https://"))
+
+
+def _clean(t):
+    return re.sub(r"\s+", " ", str(t or "")).strip()
+
+
+def _chromium_roots():
+    """(name, user-data folder, folder-is-itself-the-profile) for every Chromium-based browser we know about."""
+    h = Path.home()
+    if sys.platform == "win32":
+        la = Path(os.environ.get("LOCALAPPDATA", h / "AppData" / "Local"))
+        ra = Path(os.environ.get("APPDATA", h / "AppData" / "Roaming"))
+        return [("Chrome", la / "Google/Chrome/User Data", False), ("Edge", la / "Microsoft/Edge/User Data", False),
+                ("Brave", la / "BraveSoftware/Brave-Browser/User Data", False), ("Vivaldi", la / "Vivaldi/User Data", False),
+                ("Chromium", la / "Chromium/User Data", False), ("Opera", ra / "Opera Software/Opera Stable", True),
+                ("Opera GX", ra / "Opera Software/Opera GX Stable", True)]
+    if sys.platform == "darwin":
+        a = h / "Library/Application Support"
+        return [("Chrome", a / "Google/Chrome", False), ("Edge", a / "Microsoft Edge", False),
+                ("Brave", a / "BraveSoftware/Brave-Browser", False), ("Vivaldi", a / "Vivaldi", False),
+                ("Chromium", a / "Chromium", False), ("Arc", a / "Arc/User Data", False),
+                ("Opera", a / "com.operasoftware.Opera", True)]
+    c = h / ".config"
+    return [("Chrome", c / "google-chrome", False), ("Edge", c / "microsoft-edge", False),
+            ("Brave", c / "BraveSoftware/Brave-Browser", False), ("Vivaldi", c / "vivaldi", False),
+            ("Chromium", c / "chromium", False), ("Opera", c / "opera", True)]
+
+
+def _firefox_roots():
+    h = Path.home()
+    if sys.platform == "win32":
+        ra = Path(os.environ.get("APPDATA", h / "AppData" / "Roaming"))
+        return [("Firefox", ra / "Mozilla/Firefox/Profiles"), ("LibreWolf", ra / "LibreWolf/Profiles"),
+                ("Waterfox", ra / "Waterfox/Profiles"), ("Zen", ra / "zen/Profiles")]
+    if sys.platform == "darwin":
+        a = h / "Library/Application Support"
+        return [("Firefox", a / "Firefox/Profiles"), ("LibreWolf", a / "LibreWolf/Profiles"),
+                ("Waterfox", a / "Waterfox/Profiles"), ("Zen", a / "zen/Profiles")]
+    return [("Firefox", h / ".mozilla/firefox"), ("Firefox", h / "snap/firefox/common/.mozilla/firefox"),
+            ("Firefox", h / ".var/app/org.mozilla.firefox/.mozilla/firefox"), ("LibreWolf", h / ".librewolf"),
+            ("Waterfox", h / ".waterfox"), ("Zen", h / ".zen")]
+
+
+def detect_import_sources():
+    """Every browser profile on this computer that Fjord can import from."""
+    out = []
+    for name, root, single in _chromium_roots():
+        try:
+            if not root.is_dir():
+                continue
+            names = {}
+            try:
+                ls = json.loads((root / "Local State").read_text("utf-8"))
+                names = {k: v.get("name") for k, v in ls["profile"]["info_cache"].items()}
+            except Exception:
+                pass
+            dirs = [root] if single else sorted(d for d in root.iterdir()
+                                                if d.is_dir() and (d.name == "Default" or d.name.startswith("Profile ")))
+            dirs = [d for d in dirs if (d / "Bookmarks").exists() or (d / "History").exists()]
+            for d in dirs:
+                label = name if (single or len(dirs) == 1) else "%s \u00b7 %s" % (name, names.get(d.name) or d.name)
+                out.append({"name": label, "kind": "chromium", "path": str(d), "history": True})
+        except OSError:
+            continue
+    found = {}
+    for name, root in _firefox_roots():
+        try:
+            if root.is_dir():
+                for d in sorted(root.iterdir()):
+                    if d.is_dir() and (d / "places.sqlite").exists():
+                        found.setdefault(name, []).append(d)
+        except OSError:
+            continue
+    for name, dirs in found.items():
+        for d in dirs:
+            label = name if len(dirs) == 1 else "%s \u00b7 %s" % (name, re.sub(r"^[a-z0-9]{8}\.", "", d.name))
+            out.append({"name": label, "kind": "firefox", "path": str(d), "history": True})
+    if sys.platform == "darwin":
+        sp = Path.home() / "Library/Safari/Bookmarks.plist"
+        try:
+            present = sp.exists()
+        except OSError:
+            present = True  # exists but macOS is blocking access; the import will explain how to allow it
+        if present:
+            out.append({"name": "Safari", "kind": "safari", "path": str(sp), "history": False})
+    return out
+
+
+def _sqlite_rows(db, sql, args=()):
+    """Query a browser's database from a temporary copy, so a running browser's lock doesn't get in the way."""
+    db = Path(db)
+    tmpd = tempfile.mkdtemp(prefix="fjord_imp_")
+    try:
+        shutil.copy2(db, Path(tmpd) / db.name)
+        for suffix in ("-wal", "-shm"):  # recent changes may still live in the write-ahead log
+            try:
+                if db.with_name(db.name + suffix).exists():
+                    shutil.copy2(db.with_name(db.name + suffix), Path(tmpd) / (db.name + suffix))
+            except OSError:
+                pass
+        con = sqlite3.connect(str(Path(tmpd) / db.name))
+        try:
+            return con.execute(sql, args).fetchall()
+        finally:
+            con.close()
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+
+def read_chromium_bookmarks(profile):
+    data = json.loads((Path(profile) / "Bookmarks").read_text("utf-8"))
+    out = []
+
+    def walk(n, path):
+        if not isinstance(n, dict):
+            return
+        if n.get("type") == "url":
+            if _is_web(n.get("url")):
+                out.append({"url": n["url"], "title": _clean(n.get("name")) or n["url"], "folder": " \u203a ".join(path)})
+            return
+        name = _clean(n.get("name"))
+        sub_path = path + [name] if name else path
+        for c in n.get("children") or []:
+            walk(c, sub_path)
+    for node in (data.get("roots") or {}).values():
+        if isinstance(node, dict):
+            walk(node, [])
+    return out
+
+
+def read_chromium_history(profile, limit=3000):
+    rows = _sqlite_rows(Path(profile) / "History",
+                        "SELECT url, title, last_visit_time FROM urls WHERE last_visit_time > 0 "
+                        "ORDER BY last_visit_time DESC LIMIT ?", (limit,))
+    return [{"url": u, "title": _clean(t), "t": lv / 1e6 - 11644473600} for u, t, lv in rows if _is_web(u)]
+
+
+FF_FOLDERS = {"toolbar": "Bookmarks toolbar", "menu": "Bookmarks menu", "unfiled": "Other bookmarks", "mobile": "Mobile bookmarks"}
+
+
+def read_firefox_bookmarks(profile):
+    rows = _sqlite_rows(Path(profile) / "places.sqlite",
+                        "SELECT p.url, b.title, p.title, f.title FROM moz_bookmarks b JOIN moz_places p ON p.id = b.fk "
+                        "LEFT JOIN moz_bookmarks f ON f.id = b.parent WHERE b.type = 1")
+    return [{"url": u, "title": _clean(bt or pt) or u, "folder": FF_FOLDERS.get(ft or "", _clean(ft))}
+            for u, bt, pt, ft in rows if _is_web(u)]
+
+
+def read_firefox_history(profile, limit=3000):
+    rows = _sqlite_rows(Path(profile) / "places.sqlite",
+                        "SELECT url, title, last_visit_date FROM moz_places WHERE last_visit_date IS NOT NULL "
+                        "AND visit_count > 0 ORDER BY last_visit_date DESC LIMIT ?", (limit,))
+    return [{"url": u, "title": _clean(t), "t": lv / 1e6} for u, t, lv in rows if _is_web(u)]
+
+
+def read_safari_bookmarks(path):
+    with open(path, "rb") as f:
+        data = plistlib.load(f)
+    out = []
+    names = {"BookmarksBar": "Favorites", "BookmarksMenu": "Bookmarks menu"}
+
+    def walk(n, trail):
+        if not isinstance(n, dict):
+            return
+        kind = n.get("WebBookmarkType")
+        if kind == "WebBookmarkTypeLeaf":
+            u = n.get("URLString")
+            if _is_web(u):
+                out.append({"url": u, "title": _clean((n.get("URIDictionary") or {}).get("title")) or u,
+                            "folder": " \u203a ".join(trail)})
+        elif kind == "WebBookmarkTypeList":
+            title = n.get("Title") or ""
+            if title == "com.apple.ReadingList":
+                return
+            title = names.get(title, _clean(title))
+            for c in n.get("Children") or []:
+                walk(c, trail + [title] if title else trail)
+    walk(data, [])
+    return out
+
+
+class _BmHTML(HTMLParser):
+    """Reads the standard bookmarks .html file every browser can export."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out, self.stack, self.pending, self.mode, self.href, self.buf = [], [], "", None, None, ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "h3":
+            self.mode, self.buf = "h3", ""
+        elif tag == "a":
+            self.mode, self.buf, self.href = "a", "", dict(attrs).get("href")
+        elif tag == "dl":
+            self.stack.append(self.pending)
+            self.pending = ""
+
+    def handle_endtag(self, tag):
+        if tag == "h3":
+            self.pending, self.mode = _clean(self.buf), None
+        elif tag == "a" and self.mode == "a":
+            if _is_web(self.href):
+                self.out.append({"url": self.href, "title": _clean(self.buf) or self.href,
+                                 "folder": " \u203a ".join(x for x in self.stack if x)})
+            self.mode = None
+        elif tag == "dl" and self.stack:
+            self.stack.pop()
+
+    def handle_data(self, d):
+        if self.mode:
+            self.buf += d
+
+
+def read_html_bookmarks(path):
+    p = _BmHTML()
+    p.feed(Path(path).read_bytes().decode("utf-8", "replace"))
+    return p.out
+
+
+class Importer(QObject):
+    """Reads another browser's bookmarks (and history) in a worker thread and hands the result back as a signal."""
+    done = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def run(self, src, want_history):
+        threading.Thread(target=self._run, args=(src, want_history), daemon=True).start()
+
+    def _run(self, src, want_history):
+        res = {"name": src["name"], "bookmarks": [], "history": [], "notes": []}
+        kind, path = src["kind"], src["path"]
+        try:
+            if kind == "chromium":
+                try:
+                    res["bookmarks"] = read_chromium_bookmarks(path)
+                except FileNotFoundError:
+                    pass
+                if want_history:
+                    try:
+                        res["history"] = read_chromium_history(path)
+                    except Exception:
+                        res["notes"].append("History couldn't be read. Close %s completely and try again." % src["name"].split(" \u00b7 ")[0])
+            elif kind == "firefox":
+                try:
+                    res["bookmarks"] = read_firefox_bookmarks(path)
+                except Exception:
+                    raise RuntimeError("Couldn't read %s's data. Close it completely and try again." % src["name"].split(" \u00b7 ")[0])
+                if want_history:
+                    try:
+                        res["history"] = read_firefox_history(path)
+                    except Exception:
+                        res["notes"].append("History couldn't be read.")
+            elif kind == "safari":
+                res["bookmarks"] = read_safari_bookmarks(path)
+            elif kind == "html":
+                res["bookmarks"] = read_html_bookmarks(path)
+            self.done.emit(res)
+        except PermissionError:
+            if kind == "safari":
+                self.failed.emit("macOS is blocking access to Safari's data. Give Fjord (or Terminal) Full Disk Access in "
+                                 "System Settings \u203a Privacy & Security, then try again.")
+            else:
+                self.failed.emit("Fjord isn't allowed to read that file.")
+        except Exception as ex:
+            self.failed.emit(str(ex) or "Import failed.")
+
+
+def import_html(sources):
+    e = html.escape
+    rows = ""
+    for i, s in enumerate(sources):
+        hist = ('<a class=bt href="fjord://import-run?i=%d&h=1">Bookmarks + history</a>' % i) if s.get("history") else ""
+        rows += ('<div class=row><div>%s<small>%s</small></div><span class=btns><a class=bt href="fjord://import-run?i=%d&h=0">Bookmarks</a>%s</span></div>'
+                 % (e(s["name"]), "Found on this computer", i, hist))
+    if not rows:
+        rows = "<div class=row><div>No other browsers found<small>Export a bookmarks file from your browser and import it below.</small></div></div>"
+    css = themed(SETTINGS_CSS) + (".btns{display:flex;gap:8px;flex:none}.bt{padding:7px 14px;border-radius:99px;background:rgba(79,176,232,.2);"
+                                  "font-size:13px;white-space:nowrap;color:inherit;text-decoration:none}.bt:hover{background:rgba(79,176,232,.36)}"
+                                  ".note{opacity:.45;font-size:12px;margin:18px 4px}")
+    return ("<!doctype html><meta charset=utf-8><meta name=color-scheme content=dark><title>Import</title><style>" + base_css() + css
+            + "</style><main><h1>Import</h1><h2>From a browser</h2><div class=card>" + rows
+            + '</div><h2>From a file</h2><div class=card><div class=row><div>Bookmarks file (.html)<small>Works with an export from any browser</small></div>'
+            + '<span class=btns><a class=bt href="fjord://import-file">Choose file\u2026</a></span></div></div>'
+            + '<p class=note>Importing adds to what you already have; nothing is replaced. Passwords and cookies aren\'t imported. '
+              'Close the other browser first if history can\'t be read.</p></main>')
+
+
+# ----- site time budgets -----
+BUDGET_PAUSE_JS = "document.querySelectorAll('video,audio').forEach(function(m){try{m.pause()}catch(e){}})"
+BUDGET_QUICK = ("youtube.com", "reddit.com", "x.com", "instagram.com", "tiktok.com", "facebook.com", "netflix.com", "twitch.tv")
+
+
+def norm_site(s):
+    """'https://www.YouTube.com/watch?v=1' -> 'youtube.com'; returns '' if it isn't a plausible site."""
+    s = (s or "").strip().lower()
+    s = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", s)
+    s = re.split(r"[/?#:]", s)[0]
+    s = s[4:] if s.startswith("www.") else s
+    return s if re.fullmatch(r"[a-z0-9\-]+(\.[a-z0-9\-]+)+", s) else ""
+
+
+def os_idle_seconds():
+    """Seconds since the last keyboard/mouse input. Only known on Windows; elsewhere 0 (= never idle)."""
+    if sys.platform != "win32":
+        return 0.0
+    try:
+        import ctypes
+
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+        li = LASTINPUTINFO()
+        li.cbSize = ctypes.sizeof(li)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(li)):
+            return 0.0
+        return ((ctypes.windll.kernel32.GetTickCount() - li.dwTime) & 0xFFFFFFFF) / 1000.0
+    except Exception:
+        return 0.0
+
+
+class BudgetOverlay(QFrame):
+    """Dims the page and asks what to do once a site's daily budget is used up. A gentle stop, not a hard block."""
+    more = pyqtSignal()
+    skip = pyqtSignal()
+    close_tab = pyqtSignal()
+
+    def __init__(self, parent, stack):
+        super().__init__(parent)
+        self.stack = stack
+        self.key = ""
+        self._texts = ("", "")
+        self.setObjectName("budgetov")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        lay = QVBoxLayout(self)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card = QFrame()
+        card.setObjectName("budgetcard")
+        card.setFixedWidth(420)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(30, 28, 30, 24)
+        cl.setSpacing(8)
+        self.title = QLabel()
+        self.title.setObjectName("btitle")
+        self.title.setWordWrap(True)
+        self.sub = QLabel()
+        self.sub.setObjectName("bsub")
+        self.sub.setWordWrap(True)
+        cl.addWidget(self.title)
+        cl.addWidget(self.sub)
+        cl.addSpacing(10)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        for text, sig, name in (("Close tab", self.close_tab, "bprimary"), ("5 more minutes", self.more, ""),
+                                ("Ignore today", self.skip, "")):
+            b = QPushButton(text)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            if name:
+                b.setObjectName(name)
+            b.clicked.connect(lambda _c=False, s=sig: s.emit())
+            row.addWidget(b)
+        cl.addLayout(row)
+        lay.addWidget(card)
+        self.setStyleSheet(
+            "#budgetov{background:rgba(9,15,22,222)} #budgetcard{background:#132029;border:1px solid #243546;border-radius:22px}"
+            "#btitle{color:#eaf3f9;font-size:19px;font-weight:300;background:transparent}"
+            "#bsub{color:#8ea3b4;font-size:13px;background:transparent}"
+            "#budgetov QPushButton{background:rgba(255,255,255,0.07);border:none;border-radius:12px;padding:9px 14px;color:#cfe0ec}"
+            "#budgetov QPushButton:hover{background:rgba(255,255,255,0.13)}"
+            "#budgetov QPushButton#bprimary{background:rgba(79,176,232,0.28);color:#e4f4fd}"
+            "#budgetov QPushButton#bprimary:hover{background:rgba(79,176,232,0.42)}")
+        self.hide()
+
+    def place(self):
+        p = self.parentWidget()
+        if p is None or self.stack is None:
+            return
+        tl = self.stack.mapTo(p, QPoint(0, 0))
+        self.setGeometry(tl.x(), tl.y(), self.stack.width(), self.stack.height())
+        self.raise_()
+
+    def show_for(self, key, used_min, limit_min):
+        """Shows the overlay; returns True if it just appeared."""
+        newly = not self.isVisible()
+        self.key = key
+        texts = ("You've reached your limit for %s" % key,
+                 "%d minutes today, against a limit of %d. A few more minutes, or call it for now?" % (used_min, limit_min))
+        if texts != self._texts:
+            self._texts = texts
+            self.title.setText(texts[0])
+            self.sub.setText(texts[1])
+        self.place()
+        self.show()
+        if newly:
+            self.setFocus()
+        return newly
+
+    def mousePressEvent(self, e):
+        e.accept()
+
+    def wheelEvent(self, e):
+        e.accept()
+
+    def keyPressEvent(self, e):
+        e.accept()
+
+
+def budgets_html(b):
+    e = html.escape
+    bd = b.budgets
+    rows = ""
+    for k in sorted(bd["limits"]):
+        lim = bd["limits"][k]
+        used = bd["used"].get(k, 0) / 60.0
+        extra = bd["extra"].get(k, 0) / 60.0
+        total = lim + extra
+        pct = min(100, used / total * 100) if total else 0
+        note = "Ignored for today" if k in bd["off"] else ("Limit reached" if used >= total else "")
+        txt = "%d of %d min used today" % (int(used), lim) + (" (+%d bonus)" % extra if extra else "") + (" \u00b7 " + note if note else "")
+        q = quote(k, safe="")
+        rows += ('<div class=row><div style="flex:1;min-width:0">%s<small>%s</small>'
+                 '<div style="height:5px;border-radius:99px;background:rgba(255,255,255,.1);margin-top:9px;overflow:hidden">'
+                 '<div style="width:%.0f%%;height:100%%;background:linear-gradient(135deg,#4fb0e8,#7ef0d0)"></div></div></div>'
+                 '<span><a class=x href="fjord://budget-set?h=%s&d=-5">\u22125</a><a class=x href="fjord://budget-set?h=%s&d=5">+5</a>'
+                 '<a class=x href="fjord://budget-remove?h=%s">Remove</a></span></div>' % (e(k), e(txt), pct, q, q, q))
+    if not rows:
+        rows = "<div class=row><div>No budgets yet<small>Add a site below to set a daily limit for it.</small></div></div>"
+    sites = [s for s in ([b._b_suggest] if b._b_suggest else []) + list(BUDGET_QUICK) if s not in bd["limits"]]
+    chips = "".join('<a class=chip href="fjord://budget-add?site=%s&min=30">+ %s%s</a>'
+                    % (quote(s, safe=""), e(s), " (this site)" if s == b._b_suggest else "") for s in dict.fromkeys(sites))
+    return ("<!doctype html><meta charset=utf-8><meta name=color-scheme content=dark><title>Site time budgets</title><style>"
+            + base_css() + themed(SETTINGS_CSS)
+            + "</style><main><h1>Site time budgets</h1><h2>Daily limits</h2><div class=card>" + rows + "</div>"
+            + '<h2>Add a site</h2><div class=card><form class=pf action="fjord://budget-add"><div class=fr>'
+              '<input name=site placeholder="Site, e.g. youtube.com"><input name=min placeholder="Minutes per day" '
+              'style="max-width:170px" inputmode=numeric><button>Add</button></div></form>'
+            + ('<div class=chips>%s</div>' % chips if chips else "") + "</div>"
+            + '<p class=hint style="padding:18px 4px">Fjord counts the time a site is in front of you, plus any tab playing audio. '
+              'At the limit it dims the page and pauses media; you can take 5 more minutes, ignore the limit for today, or close the tab. '
+              'Counts reset at midnight and stay on this computer. Time only counts while you\'re active (idle detection works on Windows).</p></main>')
 
 
 class BgServer(QObject):
@@ -2538,7 +3311,9 @@ class Page(QWebEnginePage):
 
     def acceptNavigationRequest(self, url, nav_type, is_main):
         if is_main and url.scheme() == "fjord" and url.host() in ("clear-history", "remove-bookmark", "search", "set", "ess-remove", "ess-add", "vpn", "adblock-update", "allow-remove", "top-add", "top-remove", "bg",
-                                                                "ext-open", "ext-add", "ext-url", "ext-toggle", "ext-remove", "ext-popup", "ext-options"):
+                                                                "ext-open", "ext-add", "ext-url", "ext-toggle", "ext-remove", "ext-popup", "ext-options",
+                                                                "import-open", "import-run", "import-file",
+                                                                "budget-add", "budget-set", "budget-remove"):
             QTimer.singleShot(0, lambda: self.tab.browser.internal_action(url))
             return False
         if is_main and url.scheme() in ("http", "https"):
@@ -2573,26 +3348,109 @@ class Tab(QWebEngineView):
 
 
 class AddressBar(QLineEdit):
+    """The address field. macOS style centres the text while idle (like Safari) and rings it with a soft glow on focus;
+    Windows style grows an accent underline from the middle on focus (like a Windows 11 text box)."""
+    def __init__(self):
+        super().__init__()
+        self._glow = 0.0
+        self._glow_anim = QVariantAnimation(self)
+        self._glow_anim.setDuration(340)
+        self._glow_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._glow_anim.valueChanged.connect(self._set_glow)
+
+    def _set_glow(self, v):
+        self._glow = float(v)
+        self.update()
+
+    def _go_glow(self, to):
+        self._glow_anim.stop()
+        self._glow_anim.setStartValue(self._glow)
+        self._glow_anim.setEndValue(to)
+        self._glow_anim.start()
+
+    def refresh_style(self, focused=None):
+        if focused is None:
+            focused = self.hasFocus()
+        centred = UI["mode"] == "mac" and not focused
+        h = Qt.AlignmentFlag.AlignHCenter if centred else Qt.AlignmentFlag.AlignLeft
+        self.setAlignment(h | Qt.AlignmentFlag.AlignVCenter)
+
+    def focusInEvent(self, e):
+        super().focusInEvent(e)
+        self.refresh_style(True)
+        self._go_glow(1.0)
+
+    def focusOutEvent(self, e):
+        super().focusOutEvent(e)
+        self.refresh_style(False)
+        self._go_glow(0.0)
+
     def mousePressEvent(self, e):
         had = self.hasFocus()
         super().mousePressEvent(e)
         if not had:
             self.selectAll()
 
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        mode = UI["mode"]
+        if mode == "default":
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect())
+        if mode == "mac":
+            rad = r.height() / 2.0
+            hi = QLinearGradient(r.topLeft(), r.topRight())
+            hi.setColorAt(0.0, QColor(255, 255, 255, 0))
+            hi.setColorAt(0.5, QColor(255, 255, 255, 46))
+            hi.setColorAt(1.0, QColor(255, 255, 255, 0))
+            p.setPen(QPen(QBrush(hi), 1.0))
+            p.drawLine(QPointF(r.left() + rad * 0.6, r.top() + 0.5), QPointF(r.right() - rad * 0.6, r.top() + 0.5))
+            if self._glow > 0.01:
+                a = self._glow
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(accent_color(int(28 * a)), 3.0))
+                p.drawRoundedRect(r.adjusted(2, 2, -2, -2), rad - 2, rad - 2)
+                p.setPen(QPen(accent_color(int(150 * a)), 1.2))
+                p.drawRoundedRect(r.adjusted(0.7, 0.7, -0.7, -0.7), rad - 0.7, rad - 0.7)
+        elif self._glow > 0.01:
+            clip = QPainterPath()
+            clip.addRoundedRect(r, 5, 5)
+            p.setClipPath(clip)
+            w = r.width() * self._glow
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(accent_color())
+            p.drawRect(QRectF(r.center().x() - w / 2, r.bottom() - 2, w, 2))
+        p.end()
+
 
 class FadeButton(QToolButton):
-    """Tool button with a smooth hover highlight."""
+    """Tool button with a smooth hover highlight. macOS style adds a glass hover and a ripple on press."""
+    RIPPLE = True
+
     def __init__(self, radius=10):
         super().__init__()
         self._h = 0.0
         self.radius = radius
+        self._rip, self._rip_pt = 1.0, QPointF()
         self._anim = QVariantAnimation(self)
         self._anim.setDuration(170)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._anim.valueChanged.connect(self._set_h)
+        self._rip_anim = QVariantAnimation(self)
+        self._rip_anim.setDuration(520)
+        self._rip_anim.setStartValue(0.0)
+        self._rip_anim.setEndValue(1.0)
+        self._rip_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._rip_anim.valueChanged.connect(self._set_rip)
 
     def _set_h(self, v):
         self._h = float(v)
+        self.update()
+
+    def _set_rip(self, v):
+        self._rip = float(v)
         self.update()
 
     def _go(self, to):
@@ -2609,15 +3467,46 @@ class FadeButton(QToolButton):
         self._go(0.0)
         super().leaveEvent(e)
 
+    def mousePressEvent(self, e):
+        if self.RIPPLE and UI["mode"] == "mac" and self.isEnabled() and e.button() == Qt.MouseButton.LeftButton:
+            self._rip_pt = QPointF(e.position())
+            self._rip_anim.stop()
+            self._rip_anim.start()
+        super().mousePressEvent(e)
+
     def paintEvent(self, e):
         super().paintEvent(e)
-        if self._h > 0.01 and self.isEnabled():
-            p = QPainter(self)
-            p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(255, 255, 255, int(24 * self._h)))
-            p.drawRoundedRect(QRectF(self.rect()), self.radius, self.radius)
-            p.end()
+        mode = UI["mode"]
+        rip = mode == "mac" and self._rip < 1.0
+        if not ((self._h > 0.01 or rip) and self.isEnabled()):
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        r = QRectF(self.rect())
+        rad = shape_radius(self.radius, r)
+        if self._h > 0.01:
+            if mode == "mac":  # glass: a lit top edge fading down, with a thin rim
+                g = QLinearGradient(r.topLeft(), r.bottomLeft())
+                g.setColorAt(0.0, glass_rgba(30 * self._h))
+                g.setColorAt(1.0, glass_rgba(10 * self._h))
+                p.setBrush(QBrush(g))
+                p.drawRoundedRect(r, rad, rad)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(glass_rgba(24 * self._h), 1))
+                p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), rad, rad)
+                p.setPen(Qt.PenStyle.NoPen)
+            else:
+                p.setBrush(glass_rgba((20 if mode == "windows" else 24) * self._h))
+                p.drawRoundedRect(r, rad, rad)
+        if rip:  # a soft circle spreading out from where it was pressed
+            clip = QPainterPath()
+            clip.addRoundedRect(r, rad, rad)
+            p.setClipPath(clip)
+            k = max(r.width(), r.height()) * (0.35 + 0.9 * self._rip)
+            p.setBrush(QColor(255, 255, 255, int(44 * (1.0 - self._rip))))
+            p.drawEllipse(self._rip_pt, k, k)
+        p.end()
 
 
 class NewGroupButton(FadeButton):
@@ -2632,7 +3521,7 @@ class NewGroupButton(FadeButton):
         pen.setDashPattern([3.0, 3.0])
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.8, 0.8, -0.8, -0.8), self.radius, self.radius)
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.8, 0.8, -0.8, -0.8), rr(self.radius), rr(self.radius))
         p.end()
 
 
@@ -2837,9 +3726,113 @@ class SplitHandle(QWidget):
 PAGE_RADIUS = 16
 
 
+_NOISE = {}
+
+
+def noise_pixmap():
+    """A tiny tile of faint noise, laid over soft gradients so they don't show colour banding."""
+    pm = _NOISE.get("pm")
+    if pm is None:
+        import random
+        rnd = random.Random(7)
+        img = QImage(96, 96, QImage.Format.Format_ARGB32)
+        for y in range(96):
+            for x in range(96):
+                img.setPixelColor(x, y, QColor(255, 255, 255, rnd.randint(0, 9)))
+        pm = _NOISE["pm"] = QPixmap.fromImage(img)
+    return pm
+
+
+def paint_backdrop(p, rect):
+    """The window's background. The macOS style adds two faint glows of the accent colour (one hue only), just enough
+    for the glass to have something to pick up."""
+    r = QRectF(rect)
+    p.fillRect(r, QColor(themed("#0b141d")))
+    if UI["mode"] != "mac":
+        return
+    big = max(r.width(), r.height())
+    for cx, cy, rad, al in ((0.04, 0.0, 0.75, 46), (0.98, 1.0, 0.70, 30)):
+        g = QRadialGradient(QPointF(r.x() + r.width() * cx, r.y() + r.height() * cy), big * rad)
+        c0, c1 = QColor(ACCENT["main"]), QColor(ACCENT["main"])
+        c0.setAlpha(al)
+        c1.setAlpha(0)
+        g.setColorAt(0.0, c0)
+        g.setColorAt(1.0, c1)
+        p.fillRect(r, QBrush(g))
+    p.fillRect(r, QBrush(noise_pixmap()))
+
+
+def paint_glass(p, rect, radius, strength=1.0):
+    """Restrained liquid glass: a barely-there body lit from above, a hairline rim that is brightest at the top-left and
+    bottom-right, and one fine highlight just inside the top edge. No heavy bevels, no lenses."""
+    r = QRectF(rect)
+    s = strength
+    radius = max(0.0, min(rr(radius), r.width() / 2.0, r.height() / 2.0))
+
+    def white(a):
+        return glass_rgba(a * s)
+    path = QPainterPath()
+    path.addRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+    body = QLinearGradient(r.topLeft(), r.bottomLeft())
+    body.setColorAt(0.0, white(20))
+    body.setColorAt(1.0, white(5))
+    p.fillPath(path, QBrush(body))
+    rim = QLinearGradient(r.topLeft(), r.bottomRight())
+    rim.setColorAt(0.0, white(120))
+    rim.setColorAt(0.25, white(36))
+    rim.setColorAt(0.75, white(26))
+    rim.setColorAt(1.0, white(80))
+    p.setPen(QPen(QBrush(rim), 1.0))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawPath(path)
+    inset = min(radius * 0.7, r.width() / 3.0)
+    hi = QLinearGradient(QPointF(r.left() + inset, 0), QPointF(r.right() - inset, 0))
+    hi.setColorAt(0.0, white(0))
+    hi.setColorAt(0.5, white(55))
+    hi.setColorAt(1.0, white(0))
+    p.setPen(QPen(QBrush(hi), 1.0))
+    p.drawLine(QPointF(r.left() + inset, r.top() + 1.5), QPointF(r.right() - inset, r.top() + 1.5))
+
+
+class GlassBar(QWidget):
+    """The toolbar. In the macOS style its buttons sit in separate glass capsules, like Safari's toolbar; the groups
+    (lists of widgets) are set by ToolbarEditor.apply(). Otherwise it is flat and transparent."""
+    def __init__(self):
+        super().__init__()
+        self.caps = []
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.update()
+
+    def paintEvent(self, e):
+        if UI["mode"] != "mac" or not self.caps:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for grp in self.caps:
+            boxes = [w.geometry() for w in grp if not w.isHidden()]
+            if not boxes:
+                continue
+            u = boxes[0]
+            for b in boxes[1:]:
+                u = u.united(b)
+            u = u.adjusted(-4, -3, 4, 3)
+            paint_glass(p, QRectF(u), u.height() / 2.0, 0.9)
+        p.end()
+
+
+class Backdrop(QWidget):
+    """The window's root widget; paints the background (plus the macOS style's glows)."""
+    def paintEvent(self, e):
+        p = QPainter(self)
+        paint_backdrop(p, self.rect())
+        p.end()
+
+
 class PageCorners(QWidget):
     """Mouse-transparent overlay that paints the window background over the corners of each page,
-    giving the web view antialiased rounded corners."""
+    giving the web view antialiased rounded corners (and a hairline rim in the macOS / Windows styles)."""
     def __init__(self, area):
         super().__init__(area)
         self.area = area
@@ -2850,17 +3843,55 @@ class PageCorners(QWidget):
         rects = [w.geometry() for w in self.area.items if w.isVisible()]
         if not rects:
             return
+        rad = page_radius()
         path = QPainterPath()
         path.addRect(QRectF(self.rect()))
         for r in rects:
             hole = QPainterPath()
-            hole.addRoundedRect(QRectF(r), PAGE_RADIUS, PAGE_RADIUS)
+            hole.addRoundedRect(QRectF(r), rad, rad)
             path = path.subtracted(hole)
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(themed("#0b141d")))
-        p.drawPath(path)
+        win = self.window()
+        root = win.centralWidget() if hasattr(win, "centralWidget") else None
+        if UI["mode"] == "mac" and root is not None:
+            # the corners must match the glowing backdrop behind them, so paint that into an image and cut the corners out of it
+            dpr = self.devicePixelRatioF()
+            img = QImage(QSize(int(math.ceil(self.width() * dpr)), int(math.ceil(self.height() * dpr))),
+                         QImage.Format.Format_ARGB32_Premultiplied)
+            img.setDevicePixelRatio(dpr)
+            img.fill(Qt.GlobalColor.transparent)
+            ip = QPainter(img)
+            ip.setRenderHint(QPainter.RenderHint.Antialiasing)
+            off = self.mapTo(root, QPoint(0, 0))
+            ip.translate(-off.x(), -off.y())
+            paint_backdrop(ip, root.rect())
+            ip.resetTransform()
+            holes = QPainterPath()
+            for r in rects:
+                holes.addRoundedRect(QRectF(r), rad, rad)
+            ip.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+            ip.fillPath(holes, QColor(0, 0, 0, 255))
+            ip.end()
+            p.drawImage(0, 0, img)
+        else:
+            p.setBrush(QColor(themed("#0b141d")))
+            p.drawPath(path)
+        if UI["mode"] != "default":
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for r in rects:
+                rf = QRectF(r).adjusted(0.5, 0.5, -0.5, -0.5)
+                if UI["mode"] == "mac":
+                    g = QLinearGradient(rf.topLeft(), rf.bottomRight())
+                    g.setColorAt(0.0, QColor(255, 255, 255, 62))
+                    g.setColorAt(0.3, QColor(255, 255, 255, 16))
+                    g.setColorAt(0.7, QColor(255, 255, 255, 12))
+                    g.setColorAt(1.0, QColor(255, 255, 255, 38))
+                    p.setPen(QPen(QBrush(g), 1))
+                else:
+                    p.setPen(QPen(QColor(255, 255, 255, 20), 1))
+                p.drawRoundedRect(rf, rad, rad)
         p.end()
 
 
@@ -3034,12 +4065,16 @@ class SideFrame(DropTarget, QFrame):
 
     def paintEvent(self, e):
         super().paintEvent(e)
-        if self.drop_on:
+        glass = UI["mode"] == "mac"
+        if glass or self.drop_on:
             p = QPainter(self)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            p.setPen(QPen(accent_color(190), 1.5, Qt.PenStyle.DashLine))
-            p.setBrush(accent_color(16))
-            p.drawRoundedRect(QRectF(self.rect()).adjusted(2.5, 2.5, -2.5, -2.5), 14, 14)
+            if glass:
+                paint_glass(p, self.rect(), 20)
+            if self.drop_on:
+                p.setPen(QPen(accent_color(190), 1.5, Qt.PenStyle.DashLine))
+                p.setBrush(accent_color(16))
+                p.drawRoundedRect(QRectF(self.rect()).adjusted(2.5, 2.5, -2.5, -2.5), rr(14), rr(14))
             p.end()
 
 
@@ -3066,6 +4101,24 @@ class TabList(DropTarget, QListWidget):
         self.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
+        m = self.model()
+        for sig in (m.rowsInserted, m.rowsRemoved, m.dataChanged, m.layoutChanged):
+            sig.connect(lambda *a: self.updateGeometry())
+
+    def sizeHint(self):
+        if self.flow() != QListView.Flow.LeftToRight:
+            return super().sizeHint()
+        w = 2 * self.frameWidth() + self.spacing()
+        for i in range(self.count()):
+            it = self.item(i)
+            if not it.isHidden():
+                w += it.sizeHint().width() + self.spacing()
+        return QSize(w, self.maximumHeight())
+
+    def minimumSizeHint(self):
+        if self.flow() != QListView.Flow.LeftToRight:
+            return super().minimumSizeHint()
+        return QSize(60, self.maximumHeight())
 
     def paintEvent(self, e):
         if self.islands:
@@ -3088,7 +4141,7 @@ class TabList(DropTarget, QListWidget):
                 box = QRectF(u).adjusted(-1, 1, 1, -1) if horiz else QRectF(u).adjusted(1, 1, -1, -1)
                 p.setBrush(QColor(c.red(), c.green(), c.blue(), 32))
                 p.setPen(QPen(QColor(c.red(), c.green(), c.blue(), 95), 1))
-                p.drawRoundedRect(box, 14, 14)
+                p.drawRoundedRect(box, rr(14), rr(14))
             p.end()
         super().paintEvent(e)
 
@@ -3200,6 +4253,22 @@ class TabDelegate(QStyledItemDelegate):
                     opt.state = opt.state & ~QStyle.StateFlag.State_MouseOver
             option = opt
         super().paint(painter, option, index)
+        if UI["mode"] == "windows" and option.state & QStyle.StateFlag.State_Selected:
+            # Windows 11 marks the current tab with a small accent pill
+            horiz = option.widget is not None and option.widget.flow() == QListView.Flow.LeftToRight
+            rc = QRectF(option.rect)
+            pill = QRectF(rc.center().x() - 8, rc.bottom() - 4, 16, 3) if horiz else QRectF(rc.left() + 2, rc.center().y() - 8, 3, 16)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(accent_color())
+            painter.drawRoundedRect(pill, 1.5, 1.5)
+            painter.restore()
+        if UI["mode"] == "mac" and option.state & QStyle.StateFlag.State_Selected:
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            paint_glass(painter, QRectF(option.rect).adjusted(0, 2, 0, -2), 12, 0.8)
+            painter.restore()
 
 
 class TabRow(QWidget):
@@ -3322,7 +4391,7 @@ class TabRow(QWidget):
         oy = self.hdr_extra if (self.hdr_chip is not None and not self.hdr_horiz) else 0
         p.setPen(QPen(accent_color(255), 2))
         p.setBrush(accent_color(50))
-        p.drawRoundedRect(QRectF(2 + ox, 2 + oy, self.width() - 4 - ox, self.height() - 4 - oy), 12, 12)
+        p.drawRoundedRect(QRectF(2 + ox, 2 + oy, self.width() - 4 - ox, self.height() - 4 - oy), rr(12), rr(12))
         p.end()
 
     def resizeEvent(self, e):
@@ -3998,7 +5067,7 @@ class MediaPlayer(QFrame):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(accent_color(45))
-        p.drawRoundedRect(QRectF(0, 0, 72, 72), 20, 20)
+        p.drawRoundedRect(QRectF(0, 0, 72, 72), rr(20), rr(20))
         ic = self.tab.icon() if self.tab is not None else QIcon()
         if not ic.isNull():
             ip = ic.pixmap(40, 40)
@@ -4537,7 +5606,7 @@ class GlyphTile(QWidget):
         if self.tile:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(accent_color(36))
-            p.drawRoundedRect(r, 11, 11)
+            p.drawRoundedRect(r, rr(11), rr(11))
         g = r.width() * (0.5 if self.tile else 1.0)
         draw_glyph(p, self.kind, QRectF(r.center().x() - g / 2, r.center().y() - g / 2, g, g), accent_color(), 1.6)
         p.end()
@@ -4606,12 +5675,15 @@ class ToolIcon(FadeButton):
             bg = QColor(col)
             bg.setAlpha(40)
             p.setBrush(bg)
-            p.drawRoundedRect(r, 12, 12)
+            rad = shape_radius(12, r)
+            p.drawRoundedRect(r, rad, rad)
         elif not self.isEnabled():
             col = QColor(themed("#3f5163"))
         else:
             col = _mix(QColor(themed("#b5c6d4")), QColor("#ffffff"), self._h)
         g = float(self.GLYPH)
+        if UI["mode"] == "mac":  # the icon swells a little under the pointer and dips when pressed
+            g *= 1.0 + 0.12 * self._h - (0.08 if self.isDown() else 0.0)
         draw_glyph(p, self.kind, QRectF(r.center().x() - g / 2, r.center().y() - g / 2, g, g), col, self.STROKE)
         p.end()
 
@@ -4795,12 +5867,12 @@ class TbOverlay(QWidget):
                 p.setBrush(accent_color(34))
             else:
                 p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(r, 12, 12)
+            p.drawRoundedRect(r, rr(12), rr(12))
             pen = QPen(accent_color(170 if hot else 90), 1.2)
             pen.setDashPattern([3.0, 3.0])
             p.setPen(pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(r, 12, 12)
+            p.drawRoundedRect(r, rr(12), rr(12))
         if self.marker is not None:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(accent_color())
@@ -4836,7 +5908,7 @@ class TbTile(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(255, 255, 255, 16))
-        p.drawRoundedRect(QRectF(self.rect()), 12, 12)
+        p.drawRoundedRect(QRectF(self.rect()), rr(12), rr(12))
         cx, cy, col = self.W / 2.0, 22.0, QColor(themed("#b5c6d4"))
         if self.iid == "sep":
             p.setPen(QPen(col, 1.5))
@@ -4957,7 +6029,7 @@ class TbPanel(QFrame):
             pen.setDashPattern([4.0, 4.0])
             p.setPen(pen)
             p.setBrush(accent_color(24))
-            p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 16, 16)
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), rr(16), rr(16))
             p.end()
 
 
@@ -4997,22 +6069,59 @@ class ToolbarEditor(QObject):
             lay.removeWidget(w)
         lay.removeWidget(win.drag_zone)
         lay.removeWidget(win.winctl)
+        win.strip_lay.removeWidget(win.winctl)
+        for i in reversed(range(lay.count())):  # drop the gaps and stretches added by a previous apply()
+            if lay.itemAt(i).spacerItem() is not None:
+                lay.takeAt(i)
+        mac = UI["mode"] == "mac"
+        win.addr.setMaximumWidth(680 if mac else 16777215)  # Safari's address pill is a centred field, not full width
+        if mac and not horiz:  # Safari puts the window buttons at the far left
+            lay.addWidget(win.winctl)
+            lay.addSpacing(12)
         for iid in [i for i in self.widgets if "#" in i and i not in self.order]:
             w = self.widgets.pop(iid)
             w.hide()
             w.deleteLater()
         shown = set()
+        caps, run = [], []  # macOS style: the buttons are grouped into glass capsules
         for iid in self.order:
             if (iid == "side" and horiz) or (iid == "scratch" and not horiz):
                 continue  # no sidebar button without a sidebar; the scratchpad icon sits in the sidebar otherwise
             w = self.widget(iid)
-            lay.addWidget(w, TB_STRETCH.get(tb_base(iid), 0))
+            base = tb_base(iid)
+            if mac and base == "addr":
+                caps.append(run)
+                run = []
+                lay.addStretch(1)
+            lay.addWidget(w, TB_STRETCH.get(base, 0))
+            if mac:
+                if base == "addr":
+                    lay.addStretch(1)
+                elif base in ("sep", "space"):
+                    caps.append(run)
+                    run = []
+                else:
+                    run.append(w)
+                    if iid == "side":  # the sidebar button gets a capsule of its own
+                        caps.append(run)
+                        run = []
+                        lay.addSpacing(10)
             w.show()
             if isinstance(w, TbSpacer):
                 w.set_editing(self.editing)
             shown.add(iid)
+        caps.append(run)
+        win.toolbar.caps = [c for c in caps if c] if mac else []
         lay.addWidget(win.drag_zone)
-        lay.addWidget(win.winctl)
+        if horiz:  # horizontal tabs: the window buttons live on the tab row, like Chrome
+            if mac:
+                win.strip_lay.insertWidget(0, win.winctl)
+            else:
+                win.strip_lay.addWidget(win.winctl)
+        elif not mac:
+            lay.addWidget(win.winctl)
+        win.winctl.show()
+        win.toolbar.update()
         for iid, w in self.widgets.items():
             if iid not in shown and not (iid == "scratch" and not horiz):
                 w.hide()
@@ -5141,6 +6250,13 @@ def default_winbtns():
     return "mac" if sys.platform == "darwin" else "windows"
 
 
+def effective_winbtns(st):
+    """The macOS and Windows interface styles bring their own window buttons; Default uses the saved choice."""
+    if UI["mode"] in ("mac", "windows"):
+        return UI["mode"]
+    return st.get("winbtns", default_winbtns())
+
+
 class DragFilter(QObject):
     """The window has no title bar, so pressing on a bare patch of chrome (not on a button or field) drags it.
     Double-clicking the same spot maximises / restores, like a real title bar."""
@@ -5179,6 +6295,7 @@ class EdgeGrip(QWidget):
 class WinButton(FadeButton):
     """One of the minimise / zoom / close buttons. Paints itself in either the Windows or the macOS look."""
     MAC = {"close": (255, 95, 87), "min": (254, 188, 46), "zoom": (40, 200, 64)}
+    RIPPLE = False
 
     def __init__(self, role, ctl):
         super().__init__(12)
@@ -5203,10 +6320,10 @@ class WinButton(FadeButton):
         if self.role == "close":
             if h > 0.01 or down:
                 p.setBrush(QColor(196, 43, 28) if down else QColor(232, 17, 35, int(255 * h)))
-                p.drawRoundedRect(r, 12, 12)
+                p.drawRoundedRect(r, rr(12), rr(12))
         elif h > 0.01 or down:
             p.setBrush(QColor(255, 255, 255, 40 if down else int(24 * h)))
-            p.drawRoundedRect(r, 12, 12)
+            p.drawRoundedRect(r, rr(12), rr(12))
         col = _mix(QColor(themed("#b5c6d4")), QColor("#ffffff"), h)
         p.setPen(QPen(col, 1.3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -5278,7 +6395,13 @@ class WindowControls(QWidget):
         mac = self.mode == "mac"
         for b in self.buttons():
             self.lay.removeWidget(b)
-        for b in ((self.b_zoom, self.b_min, self.b_close) if mac else (self.b_min, self.b_zoom, self.b_close)):
+        if mac and UI["mode"] == "mac":
+            order = (self.b_close, self.b_min, self.b_zoom)  # on the left, like Safari
+        elif mac:
+            order = (self.b_zoom, self.b_min, self.b_close)
+        else:
+            order = (self.b_min, self.b_zoom, self.b_close)
+        for b in order:
             self.lay.addWidget(b)
             b.setFixedSize(20 if mac else ToolIcon.SIZE, ToolIcon.SIZE)
         self.lay.setSpacing(0 if mac else 2)
@@ -5360,7 +6483,7 @@ class ScratchButton(DropTarget, FadeButton):
         if lit:
             p.setPen(QPen(accent_color(200), 1.3, Qt.PenStyle.DashLine) if self.drop_on else Qt.PenStyle.NoPen)
             p.setBrush(accent_color(30))
-            p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 12, 12)
+            p.drawRoundedRect(r.adjusted(1, 1, -1, -1), rr(12), rr(12))
         h = self._h
         col = accent_color() if lit else QColor(int(181 + 74 * h), int(198 + 57 * h), int(212 + 43 * h))
         gs = ToolIcon.GLYPH if self.horiz else 20
@@ -5393,7 +6516,7 @@ class ScratchButton(DropTarget, FadeButton):
                 bx = r.width() - 10 - badge_w
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(accent_color(46))
-                p.drawRoundedRect(QRectF(bx, (r.height() - 19) / 2, badge_w, 19), 9.5, 9.5)
+                p.drawRoundedRect(QRectF(bx, (r.height() - 19) / 2, badge_w, 19), rr(9.5), rr(9.5))
                 p.setPen(accent_color())
                 p.drawText(QRectF(bx, 0, badge_w, r.height()), Qt.AlignmentFlag.AlignCenter, label)
                 badge_w += 16
@@ -5501,6 +6624,7 @@ class ScratchCard(QFrame):
         return name, "%s · %s · %s" % (Path(name).suffix.lstrip(".").upper()[:5] or "File", size, when)
 
     def mousePressEvent(self, e):
+        self.o.pin()
         self._press = e.position().toPoint() if e.button() == Qt.MouseButton.LeftButton else None
         super().mousePressEvent(e)
 
@@ -5537,6 +6661,12 @@ class ScratchDrawer(DropTarget, QFrame):
         self.drop_on = False
         self.reveal = 0.0
         self.full = SCRATCH_W
+        self.auto = False  # opened by a drag (not by the user), so it tucks itself away afterwards
+
+        self.leave_timer = QTimer(self)  # a drag "leaving" a widget is usually just it moving onto the next one
+        self.leave_timer.setSingleShot(True)
+        self.leave_timer.timeout.connect(self.auto_close)
+        QApplication.instance().installEventFilter(self)
 
         self.body = QWidget(self)
         self.body.setObjectName("sbody")
@@ -5572,6 +6702,7 @@ class ScratchDrawer(DropTarget, QFrame):
         self.input.setPlaceholderText("Type or paste a note or link…")
         self.input.setAcceptDrops(False)  # so drops on it land in the Scratchpad instead of the text box
         self.input.returnPressed.connect(self.add_note)
+        self.input.textEdited.connect(lambda _t: self.pin())
         lay.addWidget(self.input)
 
         self.scroll = DropScroll()
@@ -5601,6 +6732,7 @@ class ScratchDrawer(DropTarget, QFrame):
 
     # ----- open / close -----
     def toggle(self):
+        self.pin()
         self.set_open(not self.want)
 
     def set_open(self, on):
@@ -5645,6 +6777,40 @@ class ScratchDrawer(DropTarget, QFrame):
         if self.isVisible():
             self.raise_()
 
+    # ----- pop up while dragging -----
+    def popup_enabled(self):
+        return bool(self.b.settings.get("scratch_popup", True))
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t not in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.DragLeave, QEvent.Type.Drop):
+            return False
+        if not isinstance(obj, QWidget) or obj.window() is not self.b.window():
+            return False
+        if t in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+            if self.popup_enabled() and self.accepts(ev.mimeData()):
+                self.leave_timer.stop()
+                if not self.want:
+                    self.auto = True
+                    self.set_open(True)
+        elif t == QEvent.Type.DragLeave:
+            if self.auto:
+                self.leave_timer.start(400)
+        else:  # Drop: leave it open long enough to see the new card land, or tuck away fast if it went elsewhere
+            if self.auto:
+                self.leave_timer.start(300)
+        return False  # never swallow the event; the widgets under the pointer still handle it
+
+    def auto_close(self):
+        if self.auto and self.want:
+            self.set_open(False)
+        self.auto = False
+
+    def pin(self):
+        """The person is using the drawer, so stop it from tucking itself away."""
+        self.auto = False
+        self.leave_timer.stop()
+
     # ----- drops -----
     def accepts(self, md):
         if md.hasFormat(TAB_MIME) or md.hasFormat(SCRATCH_MIME):
@@ -5664,7 +6830,7 @@ class ScratchDrawer(DropTarget, QFrame):
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
             p.setPen(QPen(accent_color(190), 1.5, Qt.PenStyle.DashLine))
             p.setBrush(accent_color(16))
-            p.drawRoundedRect(QRectF(self.rect()).adjusted(2.5, 2.5, -2.5, -2.5), 14, 14)
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(2.5, 2.5, -2.5, -2.5), rr(14), rr(14))
             p.end()
 
     @staticmethod
@@ -5755,6 +6921,8 @@ class ScratchDrawer(DropTarget, QFrame):
             self.b.scratch_btn.bump()
             msg = "Added to Scratchpad" if n == 1 else "Added %d items to Scratchpad" % n
             self.b.toast(msg + (" · " + errs[0] if errs else ""), 3200)
+            if self.auto:
+                self.leave_timer.start(1600)
         else:
             self.b.toast(errs[0] if errs else "Nothing to add", 4000)
 
@@ -5885,6 +7053,1375 @@ class ScratchDrawer(DropTarget, QFrame):
         d.exec(Qt.DropAction.CopyAction)
 
 
+# ----- welcome tour -----
+# A first-run walkthrough in the spirit of Zen's: a glass card floats over the dimmed browser and takes you through
+# importing, accent colour, layout and every headline feature, with each choice applied live behind it.
+TOUR_TEXT, TOUR_MUTED = "#eaf3f9", "#8ea3b4"
+TOUR_SWATCHES = [("Fjord", None), ("Coral", "#ff7a6b"), ("Amber", "#ffb454"), ("Lemon", "#f4d35e"), ("Lime", "#9be564"),
+                 ("Mint", "#4fe3a8"), ("Teal", "#34d1d1"), ("Sky", "#5aa9ff"), ("Indigo", "#7c83ff"),
+                 ("Violet", "#b07cff"), ("Orchid", "#e27bf0"), ("Rose", "#ff6fa5")]
+TOUR_GLYPHS = {"split", "group", "pin", "clock", "play", "note", "block", "import", "palette", "layout", "check"}
+
+
+def kb(keys):
+    """A shortcut as it should read on this computer (Ctrl+T becomes \u2318T on a Mac)."""
+    if sys.platform != "darwin":
+        return keys
+    return keys.replace("Ctrl+", "\u2318").replace("Shift+", "\u21e7").replace("Alt+", "\u2325")
+
+
+def key_chips(keys):
+    return [kb(keys)] if sys.platform == "darwin" else keys.split("+")
+
+
+def tour_glyph(p, kind, rect, color, width=1.6):
+    """draw_glyph plus a few extra icons the tour needs (same 24x24 grid, same stroke handling)."""
+    if kind not in TOUR_GLYPHS:
+        draw_glyph(p, kind, rect, color, width)
+        return
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.translate(rect.x(), rect.y())
+    p.scale(rect.width() / 24.0, rect.height() / 24.0)
+    pen = QPen(QColor(color))
+    pen.setWidthF(width * 24.0 / max(1.0, rect.width()))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    P = QPointF
+    if kind == "split":
+        p.drawRoundedRect(QRectF(3.5, 4.5, 17, 15), 3, 3)
+        p.drawLine(P(12, 4.5), P(12, 19.5))
+    elif kind == "group":
+        p.drawRoundedRect(QRectF(3.5, 8, 17, 11.5), 3, 3)
+        p.drawLine(P(7, 4.8), P(13, 4.8))
+    elif kind == "pin":
+        for x in (4.0, 13.5):
+            for y in (4.0, 13.5):
+                p.drawRoundedRect(QRectF(x, y, 6.5, 6.5), 2, 2)
+    elif kind == "clock":
+        p.drawEllipse(P(12, 12), 8.5, 8.5)
+        p.drawPolyline(QPolygonF([P(12, 7), P(12, 12), P(15.6, 14.2)]))
+    elif kind == "play":
+        p.drawPolygon(QPolygonF([P(9, 6.5), P(18, 12), P(9, 17.5)]))
+    elif kind == "note":
+        p.drawRoundedRect(QRectF(4.5, 4.5, 15, 15), 3, 3)
+        p.drawLine(P(8, 10), P(16, 10))
+        p.drawLine(P(8, 14), P(13, 14))
+    elif kind == "block":
+        p.drawEllipse(P(12, 12), 8.5, 8.5)
+        p.drawLine(P(6, 6), P(18, 18))
+    elif kind == "import":
+        p.drawLine(P(12, 4), P(12, 14.5))
+        p.drawPolyline(QPolygonF([P(8, 10.8), P(12, 14.8), P(16, 10.8)]))
+        p.drawPolyline(QPolygonF([P(5, 15), P(5, 19), P(19, 19), P(19, 15)]))
+    elif kind == "palette":
+        p.drawEllipse(P(12, 12), 8.5, 8.5)
+        for x, y in ((8.5, 10), (12, 7.8), (15.5, 10)):
+            p.drawEllipse(P(x, y), 0.9, 0.9)
+    elif kind == "layout":
+        p.drawRoundedRect(QRectF(3.5, 4.5, 17, 15), 3, 3)
+        p.drawLine(P(9.5, 4.5), P(9.5, 19.5))
+    elif kind == "check":
+        p.drawPolyline(QPolygonF([P(5, 12.5), P(10, 17.5), P(19, 7)]))
+    p.restore()
+
+
+class Smooth:
+    """Mixin: ease a float attribute towards a target (self.smooth("_h", 1.0)) and repaint on every step."""
+    def smooth(self, name, to, ms=200, curve=QEasingCurve.Type.OutCubic):
+        anims = self.__dict__.setdefault("_smooth_anims", {})
+        old = anims.get(name)
+        if old is not None:
+            old.stop()
+        a = QVariantAnimation(self)
+        a.setDuration(max(1, ms))
+        a.setStartValue(float(getattr(self, name)))
+        a.setEndValue(float(to))
+        a.setEasingCurve(curve)
+        a.valueChanged.connect(lambda v, n=name: (setattr(self, n, float(v)), self.update()))
+        anims[name] = a
+        a.start()
+
+
+class RiseEffect(QGraphicsEffect):
+    """Fades a widget in while it drifts up into place (sign=1), or out while it drifts away (sign=-1)."""
+    def __init__(self, parent, sign=1):
+        super().__init__(parent)
+        self._sign = sign
+        self._o, self._dy = 0.0, 0.0
+        self.set_progress(0.0)
+
+    def set_progress(self, v):
+        v = max(0.0, min(1.0, float(v)))
+        self._o = v
+        self._dy = self._sign * 14.0 * (1.0 - v)
+        self.update()
+
+    def boundingRectFor(self, rect):
+        return rect.adjusted(0, -18, 0, 18)
+
+    def draw(self, painter):
+        try:
+            pm, off = self.sourcePixmap(Qt.CoordinateSystem.LogicalCoordinates)
+        except Exception:
+            self.drawSource(painter)
+            return
+        if pm.isNull():
+            return
+        painter.setOpacity(painter.opacity() * self._o)
+        painter.drawPixmap(off + QPoint(0, int(round(self._dy))), pm)
+
+
+class TourCard(QWidget):
+    """The floating glass card (with a soft shadow in its margin)."""
+    M = 18
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(self.M, self.M, -self.M, -self.M)
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(16):
+            p.setBrush(QColor(0, 0, 0, int(9 * (1 - i / 16.0))))
+            p.drawRoundedRect(r.adjusted(-i, -i + 9, i, i + 9), 20 + i, 20 + i)
+        body = QColor(themed("#0d1620"))
+        body.setAlpha(252)
+        p.setBrush(body)
+        p.drawRoundedRect(r, 20, 20)
+        clip = QPainterPath()
+        clip.addRoundedRect(r, 20, 20)
+        g = QLinearGradient(r.topLeft(), QPointF(r.left(), r.top() + r.height() * 0.4))
+        g.setColorAt(0.0, accent_color(14))
+        g.setColorAt(1.0, accent_color(0))
+        p.fillPath(clip, QBrush(g))
+        p.setBrush(Qt.BrushStyle.NoBrush)  # one hairline instead of the heavy glass rim
+        p.setPen(QPen(QColor(255, 255, 255, 22), 1.0))
+        p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 20, 20)
+        p.end()
+
+
+_TOUR_LOGO = {}
+
+
+def tour_logo():
+    """The Fjord logo from fjord.ico, at its largest stored size (cached; null pixmap if the file is missing)."""
+    if "pm" not in _TOUR_LOGO:
+        pm = QPixmap()
+        try:
+            ic = QIcon(resource_path("fjord.ico"))
+            sizes = ic.availableSizes()
+            big = max(sizes, key=lambda s: s.width()) if sizes else QSize(256, 256)
+            pm = ic.pixmap(big)
+        except Exception:
+            pass
+        _TOUR_LOGO["pm"] = pm
+    return _TOUR_LOGO["pm"]
+
+
+class TourHero(Smooth, QWidget):
+    """The top of the card: the Fjord logo on a soft glow (welcome page), or a slim glyph ring on the other pages."""
+    def __init__(self):
+        super().__init__()
+        self.kind, self.t, self.t0, self._in = "wordmark", 0.0, 0.0, 0.0
+        self.col = QColor(ACCENT["main"])
+        self._cfrom = self._cto = QColor(self.col)
+        self._canim = QVariantAnimation(self)
+        self._canim.setDuration(480)
+        self._canim.setStartValue(0.0)
+        self._canim.setEndValue(1.0)
+        self._canim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._canim.valueChanged.connect(self._mixcol)
+
+    def _mixcol(self, v):
+        self.col = _mix(self._cfrom, self._cto, float(v))
+        self.update()
+
+    def set_color(self, c):
+        """Glide to a new accent colour instead of jumping."""
+        self._cfrom, self._cto = QColor(self.col), QColor(c)
+        self._canim.stop()
+        self._canim.start()
+
+    def set_kind(self, kind):
+        self.kind = kind
+        self.t0 = self.t
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = float(self.width()), float(self.height())
+        cx, cy = w / 2.0, h / 2.0 + 6
+        col, t, k = QColor(self.col), self.t, max(0.0, min(1.0, self._in))
+        ease = k * k * (3 - 2 * k)
+        bt = max(0.0, t - self.t0)
+        glow = QRadialGradient(QPointF(cx, cy), 120)
+        g0, g1 = QColor(col), QColor(col)
+        g0.setAlpha(int(46 * k))
+        g1.setAlpha(0)
+        glow.setColorAt(0.0, g0)
+        glow.setColorAt(1.0, g1)
+        p.fillRect(self.rect(), QBrush(glow))
+        ph = (t / 3.4) % 1.0  # a single slow pulse
+        c = QColor(col)
+        c.setAlpha(int(60 * (1 - ph) * k))
+        p.setPen(QPen(c, 1.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        rad = 34 + ph * 52
+        p.drawEllipse(QPointF(cx, cy), rad, rad)
+        logo = tour_logo()
+        if self.kind == "wordmark" and not logo.isNull():
+            S = 68.0 * (0.9 + 0.1 * ease)
+            box = QRectF(cx - S / 2, cy - S / 2, S, S)
+            p.setOpacity(k)
+            p.setPen(Qt.PenStyle.NoPen)
+            sh = QColor(col)
+            sh.setAlpha(int(40 * k))
+            p.setBrush(sh)
+            p.drawRoundedRect(box.adjusted(-5, -5, 5, 5), S * 0.26, S * 0.26)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            clip = QPainterPath()
+            clip.addRoundedRect(box, S * 0.22, S * 0.22)
+            p.save()
+            p.setClipPath(clip)
+            p.drawPixmap(box, logo, QRectF(logo.rect()))
+            p.restore()
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(255, 255, 255, 36), 1.0))
+            p.drawRoundedRect(box, S * 0.22, S * 0.22)
+            p.setOpacity(1.0)
+        elif self.kind == "wordmark":  # logo file missing: fall back to the lettering
+            f = QFont(self.font())
+            f.setPixelSize(40)
+            f.setWeight(QFont.Weight.Light)
+            f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.0 + 10.0 * (1 - ease))
+            p.setFont(f)
+            tc = QColor(TOUR_TEXT)
+            tc.setAlpha(int(255 * k))
+            p.setPen(tc)
+            p.drawText(QRectF(0, cy - 32 + 8 * (1 - ease), w, 64), Qt.AlignmentFlag.AlignCenter, "fjord")
+        else:
+            R = 32.0 * (0.8 + 0.2 * ease)
+            edge, fill = QColor(col), QColor(col)
+            edge.setAlpha(int(110 * k))
+            fill.setAlpha(int(24 * k))
+            p.setPen(QPen(edge, 1.0))
+            p.setBrush(fill)
+            p.drawEllipse(QPointF(cx, cy), R, R)
+            ink = _mix(col, QColor("#ffffff"), 0.35)
+            if self.kind == "check":
+                prog = max(0.0, min(1.0, (bt - 0.15) / 0.55))
+                a, b, c3 = QPointF(cx - 11, cy + 1), QPointF(cx - 3, cy + 9), QPointF(cx + 12, cy - 8)
+                l1, l2 = math.hypot(b.x() - a.x(), b.y() - a.y()), math.hypot(c3.x() - b.x(), c3.y() - b.y())
+                run = prog * (l1 + l2)
+                pts = [a]
+                if run <= l1:
+                    f1 = run / l1
+                    pts.append(QPointF(a.x() + (b.x() - a.x()) * f1, a.y() + (b.y() - a.y()) * f1))
+                else:
+                    f2 = (run - l1) / l2
+                    pts += [b, QPointF(b.x() + (c3.x() - b.x()) * f2, b.y() + (c3.y() - b.y()) * f2)]
+                pen = QPen(ink, 2.6)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                p.setPen(pen)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                if prog > 0:
+                    p.drawPolyline(QPolygonF(pts))
+                if bt < 1.4:  # one burst of sparks when the tour completes
+                    q = min(1.0, bt / 1.2)
+                    out = 1 - (1 - q) ** 3
+                    for i in range(16):
+                        ang = i * math.tau / 16 + 0.2
+                        d = 36 + 50 * out * (0.7 + 0.3 * ((i * 7) % 5) / 4.0)
+                        sc = QColor(col)
+                        sc.setAlpha(int(230 * (1 - q)))
+                        p.setPen(Qt.PenStyle.NoPen)
+                        p.setBrush(sc)
+                        rr_ = 2.2 * (1 - q) + 0.5
+                        p.drawEllipse(QPointF(cx + math.cos(ang) * d, cy + math.sin(ang) * d * 0.8), rr_, rr_)
+            else:
+                p.setOpacity(k)
+                tour_glyph(p, self.kind, QRectF(cx - 15, cy - 15, 30, 30), ink, 1.6)
+                p.setOpacity(1.0)
+        p.end()
+
+
+class TourGlyph(QWidget):
+    """An icon on a soft accent tile, the lead of each feature row."""
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+        self.setFixedSize(42, 42)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(accent_color(34))
+        p.drawRoundedRect(QRectF(self.rect()), 13, 13)
+        tour_glyph(p, self.kind, QRectF(10, 10, 22, 22), accent_color(), 1.7)
+        p.end()
+
+
+class TourRowCard(QWidget):
+    """A softly rounded strip that holds one line of controls."""
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 14))
+        p.drawRoundedRect(QRectF(self.rect()), 14, 14)
+        p.end()
+
+
+class TourSwatch(Smooth, QWidget):
+    """A round colour swatch; the ring around the chosen one springs open."""
+    picked = pyqtSignal()
+
+    def __init__(self, name, hexcol, kind="color"):
+        super().__init__()
+        self.name, self.hexcol, self.kind = name, hexcol, kind
+        self._h = self._sel = 0.0
+        self.setFixedSize(42, 42)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(name)
+
+    def set_color(self, hexcol):
+        self.hexcol = hexcol
+        self.update()
+
+    def enterEvent(self, e):
+        self.smooth("_h", 1.0, 160)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.smooth("_h", 0.0, 220)
+        super().leaveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.picked.emit()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = QPointF(21, 21)
+        sel = max(0.0, min(1.0, self._sel))
+        rainbow = self.kind == "custom" and not self.hexcol
+        base = QColor(DEFAULT_ACCENT["main"] if self.kind == "default" else (self.hexcol or "#888888"))
+        if sel > 0.01:
+            ring = QColor(base)
+            ring.setAlpha(int(255 * sel))
+            R = 19.2 * (0.8 + 0.2 * self._sel)
+            p.setPen(QPen(ring, 2.0))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(c, R, R)
+        r = 15.0 + 1.6 * self._h - 2.2 * sel
+        p.setPen(Qt.PenStyle.NoPen)
+        if rainbow:
+            cg = QConicalGradient(c, 90)
+            for i, hx in enumerate(("#ff6b6b", "#ffd166", "#8ee59a", "#5aa9ff", "#b07cff", "#ff6b6b")):
+                cg.setColorAt(i / 5.0, QColor(hx))
+            p.setBrush(QBrush(cg))
+        else:
+            p.setBrush(base.lighter(100 + int(10 * self._h)))
+        p.drawEllipse(c, r, r)
+        if rainbow:
+            pen = QPen(QColor(255, 255, 255, 235), 2.0)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.drawLine(QPointF(21, 15), QPointF(21, 27))
+            p.drawLine(QPointF(15, 21), QPointF(27, 21))
+        if sel > 0.25:
+            p.setOpacity(min(1.0, (sel - 0.25) / 0.5))
+            tour_glyph(p, "check", QRectF(13, 13, 16, 16), QColor(8, 18, 26), 2.4)
+        p.end()
+
+
+class TourChoice(Smooth, QWidget):
+    """A selectable card: a little picture on top, a title and a one-line caption underneath."""
+    picked = pyqtSignal()
+
+    def __init__(self, title, sub, preview, size=(180, 100), tint=None):
+        super().__init__()
+        self.title, self.sub, self.preview, self.tint = title, sub, preview, tint
+        self._h = self._sel = 0.0
+        self.setFixedSize(*size)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_selected(self, on, animate=True):
+        if animate:
+            self.smooth("_sel", 1.0 if on else 0.0, 280, QEasingCurve.Type.OutCubic)
+        else:
+            self._sel = 1.0 if on else 0.0
+            self.update()
+
+    def enterEvent(self, e):
+        self.smooth("_h", 1.0, 160)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.smooth("_h", 0.0, 220)
+        super().leaveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.picked.emit()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        accent = QColor(self.tint or ACCENT["main"])
+        sel = max(0.0, min(1.0, self._sel))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, int(13 + 15 * self._h)))
+        p.drawRoundedRect(r, 16, 16)
+        if sel > 0.01:
+            tint = QColor(accent)
+            tint.setAlpha(int(36 * sel))
+            p.setBrush(tint)
+            p.drawRoundedRect(r, 16, 16)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 26), 1.0))
+        p.drawRoundedRect(r, 16, 16)
+        if sel > 0.01:
+            edge = QColor(accent)
+            edge.setAlpha(int(235 * sel))
+            p.setPen(QPen(edge, 1.6))
+            p.drawRoundedRect(r, 16, 16)
+        pr = QRectF(r.x() + 14, r.y() + 12, r.width() - 28, r.height() - 60)
+        self.preview(p, pr, accent, sel)
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        f.setWeight(QFont.Weight.DemiBold)
+        p.setFont(f)
+        p.setPen(QColor(TOUR_TEXT))
+        p.drawText(QRectF(r.x() + 14, pr.bottom() + 8, r.width() - 28, 18), Qt.AlignmentFlag.AlignVCenter, self.title)
+        f.setPixelSize(11)
+        f.setWeight(QFont.Weight.Normal)
+        p.setFont(f)
+        p.setPen(QColor(TOUR_MUTED))
+        sub = QFontMetrics(f).elidedText(self.sub, Qt.TextElideMode.ElideRight, int(r.width() - 28))
+        p.drawText(QRectF(r.x() + 14, pr.bottom() + 26, r.width() - 28, 16), Qt.AlignmentFlag.AlignVCenter, sub)
+        p.end()
+
+
+def _mock_window(p, r, accent, tabs, style="default"):
+    """A tiny sketch of the browser window, for the layout and style cards."""
+    p.save()
+    p.setPen(Qt.PenStyle.NoPen)
+    rad = {"default": 7.0, "mac": 11.0, "windows": 3.0}[style]
+    p.setBrush(QColor(255, 255, 255, 20))
+    p.drawRoundedRect(r, rad, rad)
+    inner = r.adjusted(4, 4, -4, -4)
+    soft, acc = QColor(255, 255, 255, 64), QColor(accent)
+    acc.setAlpha(200)
+    sub = max(2.0, rad * 0.55)
+    if tabs == "vertical":
+        side = QRectF(inner.x(), inner.y(), inner.width() * 0.3, inner.height())
+        p.setBrush(QColor(255, 255, 255, 26))
+        p.drawRoundedRect(side, sub, sub)
+        top = side.y() + 5 + (7 if style == "mac" else 0)
+        for i in range(3):
+            p.setBrush(acc if i == 0 else soft)
+            p.drawRoundedRect(QRectF(side.x() + 4, top + i * 8, side.width() - 8, 5), 2.5, 2.5)
+        page = QRectF(side.right() + 4, inner.y(), inner.right() - side.right() - 4, inner.height())
+    else:
+        strip = QRectF(inner.x(), inner.y(), inner.width(), 10)
+        w = (strip.width() - 8) / 3.0
+        for i in range(3):
+            p.setBrush(acc if i == 0 else soft)
+            p.drawRoundedRect(QRectF(strip.x() + 2 + i * w, strip.y() + 1.5, w - 4, 7), 3, 3)
+        page = QRectF(inner.x(), strip.bottom() + 3, inner.width(), inner.bottom() - strip.bottom() - 3)
+    p.setBrush(QColor(255, 255, 255, 13))
+    p.drawRoundedRect(page, sub, sub)
+    if tabs == "vertical":  # a toolbar line on the page, shaped like the style's controls
+        bar = QRectF(page.x() + 4, page.y() + 4, page.width() - 8, 6)
+        p.setBrush(QColor(255, 255, 255, 38))
+        p.drawRoundedRect(bar, 3 if style != "windows" else 1, 3 if style != "windows" else 1)
+    if style == "mac":
+        for i, hx in enumerate(("#ff5f57", "#febc2e", "#28c840")):
+            p.setBrush(QColor(hx))
+            p.drawEllipse(QPointF(inner.x() + 5 + i * 5.5, inner.y() + 4), 1.7, 1.7)
+    elif style == "windows":
+        pen = QPen(QColor(255, 255, 255, 120), 1.0)
+        p.setPen(pen)
+        x0, y0 = inner.right() - 22, inner.y() + 3
+        p.drawLine(QPointF(x0, y0 + 2), QPointF(x0 + 4, y0 + 2))
+        p.drawRect(QRectF(x0 + 8, y0, 4, 4))
+        p.drawLine(QPointF(x0 + 16, y0), QPointF(x0 + 20, y0 + 4))
+        p.drawLine(QPointF(x0 + 16, y0 + 4), QPointF(x0 + 20, y0))
+    p.restore()
+
+
+def _preview_layout(tabs):
+    return lambda p, r, accent, sel: _mock_window(p, QRectF(r.center().x() - 38, r.y(), 76, r.height()), accent, tabs)
+
+
+def _preview_style(style):
+    return lambda p, r, accent, sel: _mock_window(p, QRectF(r.center().x() - 38, r.y(), 76, r.height()), accent, "vertical", style)
+
+
+def _preview_glyph(kind, color=None):
+    def draw(p, r, accent, sel):
+        s = min(r.width(), r.height(), 46.0)
+        tour_glyph(p, kind, QRectF(r.center().x() - s / 2, r.center().y() - s / 2, s, s), QColor(color) if color else accent, 1.7)
+    return draw
+
+
+class TourSegment(Smooth, QWidget):
+    """A pill-shaped selector whose highlight slides between options."""
+    changed = pyqtSignal(int)
+
+    def __init__(self, labels, index=0):
+        super().__init__()
+        self.labels, self.index, self._pos = list(labels), index, float(index)
+        f = self._font()
+        fm = QFontMetrics(f)
+        self.widths = [fm.horizontalAdvance(t) + 28 for t in self.labels]
+        self.setFixedSize(sum(self.widths) + 6, 30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def _font(self):
+        f = QFont(self.font())
+        f.setPixelSize(12)
+        return f
+
+    def set_index(self, i, animate=True):
+        if i == self.index:
+            return
+        self.index = i
+        self.smooth("_pos", float(i), 320 if animate else 1, QEasingCurve.Type.InOutCubic)
+        self.changed.emit(i)
+
+    def mouseReleaseEvent(self, e):
+        if not self.isEnabled() or e.button() != Qt.MouseButton.LeftButton:
+            return
+        x, acc = e.position().x() - 3, 0.0
+        for i, w in enumerate(self.widths):
+            acc += w
+            if x < acc:
+                self.set_index(i)
+                return
+        self.set_index(len(self.widths) - 1)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect())
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 16))
+        p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+        cum = [3.0]
+        for w in self.widths:
+            cum.append(cum[-1] + w)
+        n = len(self.widths)
+        i = max(0, min(n - 1, int(math.floor(self._pos))))
+        tt = max(0.0, min(1.0, self._pos - i)) if i < n - 1 else 0.0
+        x = cum[i] + ((cum[i + 1] - cum[i]) * tt if i < n - 1 else 0.0)
+        wd = self.widths[i] + ((self.widths[i + 1] - self.widths[i]) * tt if i < n - 1 else 0.0)
+        hl = QRectF(x, 3, wd, r.height() - 6)
+        fill, edge = accent_color(70), accent_color(210)
+        p.setBrush(fill)
+        p.setPen(QPen(edge, 1.0))
+        p.drawRoundedRect(hl, hl.height() / 2, hl.height() / 2)
+        p.setFont(self._font())
+        for j, text in enumerate(self.labels):
+            near = max(0.0, 1.0 - abs(self._pos - j))
+            p.setPen(_mix(QColor(TOUR_MUTED), QColor("#ffffff"), near) if self.isEnabled() else QColor(90, 105, 118))
+            p.drawText(QRectF(cum[j], 0, self.widths[j], r.height()), Qt.AlignmentFlag.AlignCenter, text)
+        p.end()
+
+
+class TourToggle(Smooth, QWidget):
+    """An on/off switch with a springy knob."""
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, on=False):
+        super().__init__()
+        self.on, self._v = bool(on), 1.0 if on else 0.0
+        self.setFixedSize(48, 28)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.on = not self.on
+            self.smooth("_v", 1.0 if self.on else 0.0, 300, QEasingCurve.Type.OutBack)
+            self.toggled.emit(self.on)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        v = max(0.0, min(1.0, self._v))
+        r = QRectF(self.rect()).adjusted(1, 3, -1, -3)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(_mix(QColor(75, 92, 108), QColor(ACCENT["main"]), v))
+        p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+        x = r.x() + 3 + (r.width() - r.height()) * self._v
+        p.setBrush(QColor("#ffffff"))
+        p.drawEllipse(QPointF(x + (r.height() - 6) / 2.0 + 0.0, r.center().y()), (r.height() - 6) / 2.0, (r.height() - 6) / 2.0)
+        p.end()
+
+
+class TourDots(Smooth, QWidget):
+    """Progress dots; the current one stretches into a pill and glides along."""
+    def __init__(self, n):
+        super().__init__()
+        self.n, self._pos = n, 0.0
+        self.setFixedSize(n * 5 + 12 + (n - 1) * 5 + 2, 12)
+
+    def set_index(self, i):
+        self.smooth("_pos", float(i), 420, QEasingCurve.Type.InOutCubic)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        x = 1.0
+        for j in range(self.n):
+            near = max(0.0, 1.0 - abs(self._pos - j))
+            w = 5.0 + 12.0 * near
+            c = QColor(ACCENT["main"])
+            c.setAlpha(int(55 + 200 * near))
+            p.setBrush(c)
+            p.drawRoundedRect(QRectF(x, 4, w, 4), 2, 2)
+            x += w + 5
+        p.end()
+
+
+class TourButton(Smooth, QAbstractButton):
+    """The tour's own buttons: a filled accent pill (primary) or quiet text."""
+    def __init__(self, text, primary=False):
+        super().__init__()
+        self.primary, self._h = primary, 0.0
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(34)
+        self.set_label(text)
+
+    def _font(self):
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        f.setWeight(QFont.Weight.DemiBold if self.primary else QFont.Weight.Medium)
+        return f
+
+    def set_label(self, text):
+        self.setText(text)
+        self.setFixedWidth(QFontMetrics(self._font()).horizontalAdvance(text) + (40 if self.primary else 26))
+        self.update()
+
+    def enterEvent(self, e):
+        self.smooth("_h", 1.0, 150)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.smooth("_h", 0.0, 220)
+        super().leaveEvent(e)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        on = self.isEnabled()
+        p.setPen(Qt.PenStyle.NoPen)
+        if self.primary:
+            col = _mix(QColor(ACCENT["main"]), QColor("#ffffff"), 0.2 * self._h)
+            if self.isDown():
+                col = col.darker(110)
+            if not on:
+                col.setAlpha(80)
+            p.setBrush(col)
+            p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+            txt = QColor(7, 18, 26) if on else QColor(7, 18, 26, 140)
+        else:
+            p.setBrush(QColor(255, 255, 255, int(20 * self._h)))
+            p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+            txt = _mix(QColor(TOUR_MUTED), QColor("#ffffff"), self._h) if on else QColor(80, 95, 108)
+        p.setFont(self._font())
+        p.setPen(txt)
+        p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text())
+        p.end()
+
+
+class WelcomeTour(Smooth, QWidget):
+    """The first-run walkthrough. Lives over the whole window; every choice it offers is applied live."""
+    closed = pyqtSignal()
+    CARD_W, CARD_H = 676, 628
+
+    def __init__(self, browser, parent):
+        super().__init__(parent)
+        self.b = browser
+        self.setObjectName("tour")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._scrim, self._slide = 0.0, 0.0
+        self.i, self.t = -1, 0.0
+        self._nav = self._importing = self._closing = self._imp_done = False
+        self.page_w = {}
+        self.pages = [("welcome", "wordmark", self._pg_welcome, "Get started"),
+                      ("import", "import", self._pg_import, "Continue"),
+                      ("accent", "palette", self._pg_accent, "Continue"),
+                      ("layout", "layout", self._pg_layout, "Continue"),
+                      ("tabs", "sidebar", self._pg_tabs, "Continue"),
+                      ("speed", "speed", self._pg_speed, "Continue"),
+                      ("privacy", "shield", self._pg_privacy, "Continue"),
+                      ("tools", "scratch", self._pg_tools, "Continue"),
+                      ("done", "check", self._pg_done, "Start browsing")]
+        self.card = TourCard(self)
+        self.card.setFixedSize(self.CARD_W, self.CARD_H)
+        m = TourCard.M
+        cl = QVBoxLayout(self.card)
+        cl.setContentsMargins(m + 36, m + 6, m + 36, m + 18)
+        cl.setSpacing(0)
+        self.hero = TourHero()
+        self.hero.setFixedHeight(112)
+        cl.addWidget(self.hero)
+        self.body = QStackedWidget()
+        cl.addWidget(self.body, 1)
+        foot = QGridLayout()
+        foot.setContentsMargins(0, 12, 0, 0)
+        self.btn_skip = TourButton("Skip tour")
+        self.dots = TourDots(len(self.pages))
+        self.btn_back = TourButton("Back")
+        self.btn_next = TourButton("Get started", True)
+        right = QHBoxLayout()
+        right.setSpacing(6)
+        right.addWidget(self.btn_back)
+        right.addWidget(self.btn_next)
+        foot.addWidget(self.btn_skip, 0, 0, Qt.AlignmentFlag.AlignLeft)
+        foot.addWidget(self.dots, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        foot.addLayout(right, 0, 2, Qt.AlignmentFlag.AlignRight)
+        foot.setColumnStretch(0, 1)
+        foot.setColumnStretch(2, 1)
+        cl.addLayout(foot)
+        self.btn_back.hide()
+        self.btn_skip.clicked.connect(self.close_tour)
+        self.btn_back.clicked.connect(self.back)
+        self.btn_next.clicked.connect(self.next)
+        parent.installEventFilter(self)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.hide()
+
+    # ----- frame, painting, input -----
+    def eventFilter(self, o, e):
+        if o is self.parentWidget() and e.type() == QEvent.Type.Resize:
+            self.place()
+        return False
+
+    def place(self):
+        p = self.parentWidget()
+        if p is None:
+            return
+        self.setGeometry(p.rect())
+        self.place_card()
+        self.raise_()
+
+    def place_card(self):
+        self.card.move((self.width() - self.card.width()) // 2,
+                       max(0, (self.height() - self.card.height()) // 2) + int(self._slide))
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        s = max(0.0, min(1.0, self._scrim))
+        p.fillRect(self.rect(), QColor(5, 9, 14, int(216 * s)))
+        g = QRadialGradient(QPointF(self.width() / 2.0, self.height() / 2.0), max(self.width(), self.height()) * 0.55)
+        g.setColorAt(0.0, accent_color(int(38 * s)))
+        g.setColorAt(1.0, accent_color(0))
+        p.fillRect(self.rect(), QBrush(g))
+        p.end()
+
+    def mousePressEvent(self, e):
+        # the tour covers the window buttons, so hand clicks on them through (you can always close or minimise the window)
+        try:
+            wc, root = self.b.winctl, self.parentWidget()
+            pt = e.position().toPoint()
+            local = wc.mapFrom(root, pt)
+            if wc.isVisible() and wc.rect().contains(local):
+                btn = wc.childAt(local)
+                if btn is not None and hasattr(btn, "click"):
+                    btn.click()
+        except Exception:
+            pass
+        e.accept()
+
+    def wheelEvent(self, e):
+        e.accept()
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        if k in (Qt.Key.Key_Right, Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.next()
+        elif k == Qt.Key.Key_Left:
+            self.back()
+        elif k == Qt.Key.Key_Escape and not self._importing:
+            self.close_tour()
+        else:
+            e.accept()
+
+    def _tick(self):
+        self.t += 0.033
+        self.hero.t = self.t
+        self.hero.update()
+
+    def _accent_changed(self):
+        self.hero.set_color(QColor(ACCENT["main"]))
+        for w in self.findChildren(QWidget):
+            w.update()
+
+    # ----- opening, closing, moving between pages -----
+    def start(self):
+        self.place()
+        self.show()
+        self.raise_()
+        self.setFocus()
+        self.timer.start(33)
+        self.smooth("_scrim", 1.0, 650)
+        fx = QGraphicsOpacityEffect(self.card)
+        fx.setOpacity(0.0)
+        self.card.setGraphicsEffect(fx)
+        a = QVariantAnimation(self)
+        a.setDuration(750)
+        a.setStartValue(0.0)
+        a.setEndValue(1.0)
+        a.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def step(v):
+            fx.setOpacity(min(1.0, float(v) * 1.5))
+            self._slide = 34.0 * (1.0 - float(v))
+            self.place_card()
+        a.valueChanged.connect(step)
+        a.finished.connect(lambda: self.card.setGraphicsEffect(None))
+        self._intro = a
+        a.start()
+        QTimer.singleShot(280, lambda: self.go(0))
+
+    def close_tour(self):
+        if self._closing or self._importing:
+            return
+        self._closing = True
+        self.b._import_hook = None
+        fx = QGraphicsOpacityEffect(self.card)
+        self.card.setGraphicsEffect(fx)
+        a = QVariantAnimation(self)
+        a.setDuration(480)
+        a.setStartValue(1.0)
+        a.setEndValue(0.0)
+        a.setEasingCurve(QEasingCurve.Type.InCubic)
+
+        def step(v):
+            fx.setOpacity(float(v))
+            self._slide = 22.0 * (1.0 - float(v))
+            self.place_card()
+
+        def done():
+            self.timer.stop()
+            self.hide()
+            self.closed.emit()
+            self.deleteLater()
+        a.valueChanged.connect(step)
+        a.finished.connect(done)
+        self._outro = a
+        self.smooth("_scrim", 0.0, 520)
+        a.start()
+
+    def _page(self, i):
+        if i not in self.page_w:
+            w = self.pages[i][2]()
+            self.body.addWidget(w)
+            self.page_w[i] = w
+        return self.page_w[i]
+
+    def go(self, i):
+        if self._nav or self._closing or i == self.i or not 0 <= i < len(self.pages):
+            return
+        self._nav = True
+        old = self.body.currentWidget() if self.i >= 0 else None
+
+        def show_new():
+            self.i = i
+            page = self._page(i)
+            self.body.setCurrentWidget(page)
+            if old is not None:
+                old.setGraphicsEffect(None)
+            _name, hero_kind, _b, cta = self.pages[i]
+            self.hero.set_kind(hero_kind)
+            self.hero.smooth("_in", 1.0, 800)
+            self.dots.set_index(i)
+            self.btn_next.set_label(cta)
+            self.btn_back.setVisible(i > 0)
+            self._stagger(page)
+            QTimer.singleShot(460, lambda: setattr(self, "_nav", False))
+        if old is None:
+            show_new()
+            return
+        fx = RiseEffect(old, -1)
+        fx.set_progress(1.0)
+        old.setGraphicsEffect(fx)
+        self.hero.smooth("_in", 0.0, 160)
+        a = QVariantAnimation(self)
+        a.setDuration(170)
+        a.setStartValue(1.0)
+        a.setEndValue(0.0)
+        a.setEasingCurve(QEasingCurve.Type.InCubic)
+        a.valueChanged.connect(lambda v: fx.set_progress(float(v)))
+        a.finished.connect(show_new)
+        self._out = a
+        a.start()
+
+    def _stagger(self, page):
+        """Bring a page's pieces in one after another, each rising and fading into place."""
+        page.layout().activate()
+        for n, w in enumerate(page._stag):
+            fx = RiseEffect(w, 1)
+            w.setGraphicsEffect(fx)
+            QTimer.singleShot(70 * n, lambda w=w, fx=fx: self._reveal(w, fx))
+            QTimer.singleShot(70 * n + 1600, lambda w=w, fx=fx: self._unfx(w, fx))  # failsafe
+
+    def _reveal(self, w, fx):
+        try:
+            a = QVariantAnimation(w)
+            a.setDuration(560)
+            a.setStartValue(0.0)
+            a.setEndValue(1.0)
+            a.setEasingCurve(QEasingCurve.Type.OutCubic)
+            a.valueChanged.connect(lambda v: fx.set_progress(float(v)))
+            a.finished.connect(lambda: self._unfx(w, fx))
+            a.start()
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def _unfx(w, fx):
+        try:
+            if w.graphicsEffect() is fx:
+                w.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
+
+    def next(self):
+        if self._nav or self._importing or self._closing:
+            return
+        if self.pages[self.i][0] == "import" and self._start_imports():
+            return
+        if self.i >= len(self.pages) - 1:
+            self.close_tour()
+            return
+        self.go(self.i + 1)
+
+    def back(self):
+        if self._nav or self._importing or self._closing:
+            return
+        self.go(self.i - 1)
+
+    # ----- building blocks for the pages -----
+    def _make_page(self, title, sub):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setSpacing(0)
+        page._stag = []
+        t = QLabel(title)
+        t.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        t.setStyleSheet("color:%s;font-size:23px;font-weight:300;background:transparent" % TOUR_TEXT)
+        s = QLabel(sub)
+        s.setWordWrap(True)
+        s.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        s.setStyleSheet("color:%s;font-size:13px;background:transparent" % TOUR_MUTED)
+        lay.addWidget(t)
+        lay.addSpacing(5)
+        lay.addWidget(s)
+        lay.addSpacing(16)
+        page._stag += [t, s]
+        return page, lay
+
+    @staticmethod
+    def _add(page, w, gap=0):
+        page.layout().addWidget(w)
+        page._stag.append(w)
+        if gap:
+            page.layout().addSpacing(gap)
+
+    @staticmethod
+    def _label(text, css, wrap=True, center=False):
+        lb = QLabel(text)
+        lb.setWordWrap(wrap)
+        lb.setStyleSheet(css + ";background:transparent")
+        if center:
+            lb.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        return lb
+
+    def _cap(self, text):
+        lb = self._label(text, "color:%s;font-size:10px;font-weight:600" % TOUR_MUTED, False)
+        f = lb.font()
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.4)
+        lb.setFont(f)
+        return lb
+
+    def _chips(self, keys):
+        wrap = QWidget()
+        h = QHBoxLayout(wrap)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(4)
+        for c in key_chips(keys):
+            h.addWidget(self._label(c, "background:rgba(255,255,255,0.09);border-radius:6px;padding:2px 7px;"
+                                       "color:#cfe0ec;font-size:11px", False))
+        return wrap
+
+    def _row(self, glyph, title, desc, keys=None, right=None):
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(14)
+        h.addWidget(TourGlyph(glyph), 0, Qt.AlignmentFlag.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        head.addWidget(self._label(title, "color:%s;font-size:14px;font-weight:600" % TOUR_TEXT, False))
+        if keys:
+            head.addWidget(self._chips(keys))
+        head.addStretch(1)
+        col.addLayout(head)
+        col.addWidget(self._label(desc, "color:%s;font-size:12px" % TOUR_MUTED))
+        h.addLayout(col, 1)
+        if right is not None:
+            h.addWidget(right, 0, Qt.AlignmentFlag.AlignVCenter)
+        return row
+
+    @staticmethod
+    def _hbox(widgets, spacing=10, center=True):
+        wrap = QWidget()
+        h = QHBoxLayout(wrap)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(spacing)
+        if center:
+            h.addStretch(1)
+        for w in widgets:
+            h.addWidget(w)
+        if center:
+            h.addStretch(1)
+        return wrap
+
+    # ----- pages -----
+    def _pg_welcome(self):
+        page, lay = self._make_page("Welcome to Fjord", "The web, calm and clear.\nLet's make it yours. It only takes a minute.")
+        lay.addSpacing(8)
+        steps = [("Import", "import"), ("Colour", "palette"), ("Layout", "layout"), ("Speed", "speed"), ("Privacy", "shield")]
+        pills = []
+        for name, _g in steps:
+            pills.append(self._label(name, "background:transparent;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:4px 13px;"
+                                           "color:#9fb3c3;font-size:12px", False))
+        self._add(page, self._hbox(pills, 8), 14)
+        self._add(page, self._label("Use \u2190 \u2192 or Enter to move around. You can replay this any time from the \u22ef menu.",
+                                    "color:#5f7487;font-size:11px", True, True))
+        lay.addStretch(1)
+        return page
+
+    def _import_row(self, src):
+        row = TourRowCard()
+        row.setFixedHeight(56)
+        h = QHBoxLayout(row)
+        h.setContentsMargins(16, 0, 12, 0)
+        h.setSpacing(12)
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        name = self._label(src["name"], "color:%s;font-size:13px;font-weight:600" % TOUR_TEXT, False)
+        name.setMinimumWidth(40)
+        name.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        col.addStretch(1)
+        col.addWidget(name)
+        col.addWidget(self._label("Bookmarks and history" if src.get("history") else "Bookmarks only",
+                                  "color:%s;font-size:11px" % TOUR_MUTED, False))
+        col.addStretch(1)
+        h.addLayout(col, 1)
+        labels = ["Skip", "Bookmarks", "Bookmarks + history"] if src.get("history") else ["Skip", "Import bookmarks"]
+        seg = TourSegment(labels, 0)
+        seg.changed.connect(lambda _i: setattr(self, "_imp_done", False))
+        h.addWidget(seg)
+        self.imp_rows.append((src, seg))
+        return row
+
+    def _pg_import(self):
+        page, lay = self._make_page("Bring your stuff along",
+                                    "Choose what to import from the browsers on this computer. Passwords and cookies stay put.")
+        self.imp_rows = []
+        sources = detect_import_sources()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea{background:transparent;border:none}")
+        scroll.viewport().setAutoFillBackground(False)
+        scroll.setFixedHeight(216)
+        inner = QWidget()
+        inner.setAutoFillBackground(False)
+        self.imp_lay = QVBoxLayout(inner)
+        self.imp_lay.setContentsMargins(0, 0, 4, 0)
+        self.imp_lay.setSpacing(8)
+        for src in sources:
+            self.imp_lay.addWidget(self._import_row(src))
+        if not sources:
+            self.imp_lay.addWidget(self._label("No other browsers found on this computer.\nYou can still import a bookmarks file "
+                                               "exported from any browser.", "color:%s;font-size:12px" % TOUR_MUTED, True, True))
+        self.imp_lay.addStretch(1)
+        scroll.setWidget(inner)
+        self._add(page, scroll, 10)
+        file_btn = TourButton("Import a bookmarks file\u2026")
+        file_btn.clicked.connect(self._pick_import_file)
+        self._add(page, self._hbox([file_btn]), 4)
+        self.imp_status = self._label("", "color:%s;font-size:12px" % TOUR_MUTED, True, True)
+        self._add(page, self.imp_status)
+        lay.addStretch(1)
+        return page
+
+    def _pick_import_file(self):
+        path, _f = QFileDialog.getOpenFileName(self, "Import bookmarks", str(Path.home()),
+                                               "Bookmarks files (*.html *.htm);;All files (*)")
+        if not path:
+            return
+        src = {"kind": "html", "path": path, "name": Path(path).name, "history": False}
+        row = self._import_row(src)
+        self.imp_lay.insertWidget(max(0, self.imp_lay.count() - 1), row)
+        self.imp_rows[-1][1].set_index(1)
+
+    def _set_status(self, text):
+        self.imp_status.setText(text)
+
+    def _start_imports(self):
+        if self._imp_done:
+            return False
+        self._jobs = [(s, seg.index == 2) for s, seg in self.imp_rows if seg.index > 0]
+        if not self._jobs:
+            return False
+        self._importing = True
+        self._imp_total, self._imp_ok, self._imp_err = len(self._jobs), 0, ""
+        for w in (self.btn_next, self.btn_back, self.btn_skip):
+            w.setEnabled(False)
+        for _s, seg in self.imp_rows:
+            seg.setEnabled(False)
+        self._next_job()
+        return True
+
+    def _next_job(self):
+        if not self._jobs:
+            self._imports_finished()
+            return
+        if self.b._import_busy:
+            QTimer.singleShot(300, self._next_job)
+            return
+        src, hist = self._jobs.pop(0)
+        self._set_status("Importing from %s\u2026  (%d of %d)" % (src["name"], self._imp_total - len(self._jobs), self._imp_total))
+        self.b._import_busy = True
+        self.b._import_hook = self._job_done
+        self.b.importer.run(src, hist)
+
+    def _job_done(self, ok, msg):
+        if ok:
+            self._imp_ok += 1
+        else:
+            self._imp_err = msg
+        self._next_job()
+
+    def _imports_finished(self):
+        self.b._import_hook = None
+        self._importing = False
+        for w in (self.btn_next, self.btn_back, self.btn_skip):
+            w.setEnabled(True)
+        for _s, seg in self.imp_rows:
+            seg.setEnabled(True)
+        if self._imp_ok:
+            self._imp_done = True
+            self._set_status("Done. Imported from %d browser%s." % (self._imp_ok, "" if self._imp_ok == 1 else "s"))
+            QTimer.singleShot(1000, self.next)
+        else:
+            self._set_status(self._imp_err or "Nothing could be imported.")
+
+    def _pg_accent(self):
+        page, lay = self._make_page("Choose your accent",
+                                    "A splash of colour for tabs, buttons and highlights. Pick one and watch Fjord change.")
+        cur = self.b.settings.get("accent")
+        cur_main = str(cur.get("main", "")).lower() if isinstance(cur, dict) else ""
+        self.swatches = []
+        sw_defs = [TourSwatch(n, hx, "default" if hx is None else "color") for n, hx in TOUR_SWATCHES]
+        sw_defs.append(TourSwatch("Custom colour\u2026", None, "custom"))
+        for sw in sw_defs:
+            if sw.kind == "default":
+                on = not cur_main
+            elif sw.kind == "color":
+                pair = derive_accent(sw.hexcol)
+                on = bool(pair) and pair[0].lower() == cur_main
+            else:
+                on = False
+            sw._sel = 1.0 if on else 0.0
+            sw.picked.connect(lambda s=sw: self._pick_swatch(s))
+            self.swatches.append(sw)
+        if cur_main and not any(s._sel > 0.5 for s in self.swatches):  # a colour picked earlier with the custom swatch
+            self.swatches[-1].hexcol, self.swatches[-1]._sel = cur_main, 1.0
+        self.accent_name = self._label("", "color:%s;font-size:13px;font-weight:600" % TOUR_TEXT, False, True)
+        chosen = next((s for s in self.swatches if s._sel > 0.5), None)
+        self.accent_name.setText(chosen.name if chosen else "Custom")
+        self._add(page, self._hbox(self.swatches[:7], 10), 10)
+        self._add(page, self._hbox(self.swatches[7:], 10), 18)
+        self._add(page, self.accent_name, 6)
+        self._add(page, self._label("Fjord also tints its bars and sidebar to match, so every colour feels a little different. "
+                                    "Change it later in Settings.", "color:#5f7487;font-size:11px", True, True))
+        lay.addStretch(1)
+        return page
+
+    def _pick_swatch(self, sw):
+        name = sw.name
+        if sw.kind == "custom":
+            c = QColorDialog.getColor(QColor(sw.hexcol or ACCENT["main"]), self, "Pick an accent colour")
+            if not c.isValid():
+                return
+            pair = derive_accent(c.name(), 0.12)
+            if pair is None:
+                self.b.toast("That one is a little grey. Try something more colourful.", 3500)
+                return
+            sw.set_color(c.name())
+            name = "Custom"
+        elif sw.kind == "default":
+            pair = None
+        else:
+            pair = derive_accent(sw.hexcol)
+        for s in self.swatches:
+            s.smooth("_sel", 1.0 if s is sw else 0.0, 380, QEasingCurve.Type.OutBack)
+        self.accent_name.setText(name)
+        self.b.set_accent(pair)
+        self._accent_changed()
+
+    def _choice_group(self, items, current, on_pick):
+        """items: list of (key, TourChoice). Keeps exactly one selected and calls on_pick(key) on a change."""
+        group = []
+
+        def pick(key):
+            if key == self._cur_of(group):
+                return
+            for k, ch in group:
+                ch.set_selected(k == key)
+            on_pick(key)
+        for key, ch in items:
+            ch.set_selected(key == current, False)
+            ch.picked.connect(lambda k=key: pick(k))
+            group.append((key, ch))
+        return group
+
+    @staticmethod
+    def _cur_of(group):
+        for k, ch in group:
+            if ch._sel > 0.5:
+                return k
+        return None
+
+    def _pg_layout(self):
+        page, lay = self._make_page("Make it feel right",
+                                    "Where your tabs live and how the window looks. Both are live, and both live in Settings too.")
+        cur_layout = "horizontal" if self.b.settings.get("layout") == "horizontal" else "vertical"
+        lay_items = [("vertical", TourChoice("Vertical tabs", "A sidebar on the left", _preview_layout("vertical"), (264, 112))),
+                     ("horizontal", TourChoice("Horizontal tabs", "A strip across the top", _preview_layout("horizontal"), (264, 112)))]
+        self._choice_group(lay_items, cur_layout, self._set_layout)
+        self._add(page, self._cap("TAB LAYOUT"), 6)
+        self._add(page, self._hbox([c for _k, c in lay_items], 16), 14)
+        style_items = [(m, TourChoice(lbl, sub, _preview_style(m), (176, 112)))
+                       for m, lbl, sub in (("default", "Default", "Fjord as it is"), ("mac", "macOS", "Liquid glass, soft motion"),
+                                           ("windows", "Windows", "Flat, Windows 11 look"))]
+        self._choice_group(style_items, UI["mode"], self._set_style)
+        self._add(page, self._cap("INTERFACE STYLE"), 6)
+        self._add(page, self._hbox([c for _k, c in style_items], 12))
+        lay.addStretch(1)
+        return page
+
+    def _set_layout(self, v):
+        self.b.settings["layout"] = v
+        jsave("settings.json", self.b.settings)
+        self.b.apply_layout()
+
+    def _set_style(self, v):
+        self.b.set_ui_style(v, refresh_settings=False)
+        self._accent_changed()
+
+    def _pg_tabs(self):
+        page, lay = self._make_page("Tabs, your way", "Fjord keeps your tabs out of the way and your favourites close.")
+        rows = [("sidebar", "Sidebar tabs", "Your tabs live on the side. Hide it any time, or drag its edge to resize it.", "Ctrl+B"),
+                ("pin", "Essentials", "Pin the sites you open every day above your tabs. Right-click a tab, then Add to Essentials.", None),
+                ("group", "Tab groups", "Collect related tabs into colourful islands you can fold away. Right-click a tab, then Add to group.", None),
+                ("split", "Split view", "Drop one tab onto another to browse two pages side by side.", None)]
+        for g, t, d, k in rows:
+            self._add(page, self._row(g, t, d, k), 16)
+        lay.addStretch(1)
+        return page
+
+    def _pg_speed(self):
+        page, lay = self._make_page("How fast, how frugal?",
+                                    "Choose how much of your computer Fjord may use. The speedometer in the toolbar switches it any time.")
+        tints = {"eco": "#4ade80", "normal": None, "turbo": "#f87171"}
+        glyphs = {"eco": "speed_eco", "normal": "speed", "turbo": "speed_turbo"}
+        items = [(k, TourChoice(m["label"], m["desc"], _preview_glyph(glyphs[k], tints[k]), (176, 128), tints[k]))
+                 for k, m in SPEED_MODES.items()]
+        self._choice_group(items, self.b.speed_mode, self.b.set_speed_mode)
+        self._add(page, self._hbox([c for _k, c in items], 12), 18)
+        self._add(page, self._row("clock", "Sleeping tabs",
+                                  "Tabs you are not using doze off to save memory, then wake the moment you come back. "
+                                  "Turbo keeps everything awake."), 12)
+        self._add(page, self._label("Eco and Turbo also change process and GPU limits, which take full effect after a restart.",
+                                    "color:#5f7487;font-size:11px", True, True))
+        lay.addStretch(1)
+        return page
+
+    def _pg_privacy(self):
+        page, lay = self._make_page("Private by default", "Quieter pages, and a few tools to keep you in control.")
+        tog = TourToggle(bool(self.b.adblock.enabled))
+        tog.toggled.connect(self.b.set_adblock)
+        self._add(page, self._row("block", "Ads and trackers blocked",
+                                  "Cleaner, faster pages. Pause blocking for a single site from the \u22ef menu if one breaks.",
+                                  right=tog), 18)
+        self._add(page, self._row("shield", "VPN and proxy",
+                                  "The shield button in the toolbar sends your traffic through a SOCKS or HTTP proxy with one click. "
+                                  "Set the proxy up in Settings."), 18)
+        self._add(page, self._row("clock", "Site time budgets",
+                                  "Give distracting sites a daily limit. Fjord nudges you when it is used up. "
+                                  "Find it under \u22ef, Privacy and performance."), 4)
+        lay.addStretch(1)
+        return page
+
+    def _pg_tools(self):
+        page, lay = self._make_page("Little helpers", "Small tools that save you a trip to another app.")
+        ext_note = "" if QWebEngineExtensionManager is not None else " (Needs PyQt6 6.10 or newer.)"
+        rows = [("scratch", "Scratchpad", "Drop images, files, text or links on the sidebar to keep a copy for later.", "Ctrl+Shift+S"),
+                ("note", "Sticky notes", "Click the little note button at the bottom right of any site to pin a note to it.", None),
+                ("play", "Media player", "Whatever is playing shows up in the sidebar with its controls. Right-click it for options.", None),
+                ("puzzle", "Extensions", "Add Chrome, Firefox and Safari extensions from the puzzle-piece button." + ext_note, None)]
+        for g, t, d, k in rows:
+            self._add(page, self._row(g, t, d, k), 16)
+        lay.addStretch(1)
+        return page
+
+    def _pg_done(self):
+        page, lay = self._make_page("You're all set", "A few shortcuts worth knowing. Everything else lives in the \u22ef menu.")
+        shortcuts = [("New tab", "Ctrl+T"), ("Address bar", "Ctrl+L"), ("Bookmark page", "Ctrl+D"),
+                     ("Find in page", "Ctrl+F"), ("Reopen closed tab", "Ctrl+Shift+T"), ("History", "Ctrl+H")]
+        grid = QWidget()
+        gl = QGridLayout(grid)
+        gl.setContentsMargins(0, 0, 0, 0)
+        gl.setHorizontalSpacing(10)
+        gl.setVerticalSpacing(8)
+        for n, (name, keys) in enumerate(shortcuts):
+            cell = TourRowCard()
+            cell.setFixedHeight(44)
+            h = QHBoxLayout(cell)
+            h.setContentsMargins(14, 0, 12, 0)
+            h.addWidget(self._label(name, "color:%s;font-size:12px" % TOUR_TEXT, False), 1)
+            h.addWidget(self._chips(keys))
+            gl.addWidget(cell, n // 2, n % 2)
+        self._add(page, grid, 14)
+        self._add(page, self._label("Want to see this again? Open the \u22ef menu and choose Welcome tour.",
+                                    "color:#5f7487;font-size:11px", True, True))
+        lay.addStretch(1)
+        return page
+
+
 class Browser(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -5894,6 +8431,10 @@ class Browser(QMainWindow):
         self.resize(1280, 820)
         DATA_DIR.mkdir(exist_ok=True)
         self.settings = jload("settings.json", {"engine": "Google"})
+        UI["mode"] = valid_ui_mode(self.settings.get("ui_style"))
+        load_ui_tuning(self.settings)
+        self.tour = None            # the WelcomeTour overlay while it is open
+        self._import_hook = None    # lets the tour follow an import without the usual toast and bookmarks page
         self.bookmarks = jload("bookmarks.json", [])
         self.history = jload("history.json", [])
         self.notes = jload("notes.json", {})   # host -> list of sticky notes
@@ -5970,11 +8511,39 @@ class Browser(QMainWindow):
         self._restore_session(sys.argv[1:])
         self.open_essentials_bg()
         self.update_vpn_btn()
+        self.updater = Updater(self)
+        self.updater.found.connect(self.on_update_found)
+        self.updater.uptodate.connect(self.on_update_uptodate)
+        self.updater.failed.connect(self.on_update_failed)
+        self.updater.installed.connect(self.on_update_installed)
+        self._update_manual = False
+        self._update_busy = False
+        self.importer = Importer(self)
+        self.importer.done.connect(self.on_import_done)
+        self.importer.failed.connect(self.on_import_failed)
+        self._import_busy = False
+        self._import_sources = []
+        self.budgets = self._budgets_load()
+        self._b_last = time.monotonic()
+        self._b_ticks = 0
+        self._b_warned = set()
+        self._b_suggest = ""
+        self.budget_ov = BudgetOverlay(self, self.stack)
+        self.budget_ov.more.connect(self.budget_more)
+        self.budget_ov.skip.connect(self.budget_skip)
+        self.budget_ov.close_tab.connect(self.budget_close)
+        self._budget_timer = QTimer(self)
+        self._budget_timer.timeout.connect(self.budget_tick)
+        self._budget_timer.start(1000)
+        if self.settings.get("auto_update", True):
+            QTimer.singleShot(5000, lambda: self.check_updates(False))
         self.adblock.load_async()
         self.icons = IconFetcher()
         self.icons.ready.connect(self.on_icons_ready)
         self.icons.fetch()
         QApplication.instance().focusChanged.connect(self.on_focus_changed)
+        if not self.settings.get("tour_done"):
+            QTimer.singleShot(900, self.start_tour)
 
     @property
     def engine(self):
@@ -5982,10 +8551,10 @@ class Browser(QMainWindow):
 
     # ----- UI -----
     def _build_ui(self):
-        root = QWidget()
+        root = Backdrop()
         root.setObjectName("root")
         outer = QHBoxLayout(root)
-        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setContentsMargins(frame_margin(), frame_margin(), frame_margin(), frame_margin())
         outer.setSpacing(8)
         self.setCentralWidget(root)
 
@@ -6040,15 +8609,18 @@ class Browser(QMainWindow):
         right.setSpacing(4)
         self.strip = QWidget()
         self.strip_lay = QHBoxLayout(self.strip)
-        self.strip_lay.setContentsMargins(0, 0, 0, 4)
-        self.strip_lay.setSpacing(8)
+        self.strip_lay.setContentsMargins(0, 0, 0, 0)
+        self.strip_lay.setSpacing(6)
+        self.strip_fill = QWidget()
+        self.strip_fill.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.strip.hide()
         right.addWidget(self.strip)
-        self.toolbar = QWidget()
+        self.toolbar = GlassBar()
         tb = QHBoxLayout(self.toolbar)
         tb.setContentsMargins(0, 0, 0, 0)
         tb.setSpacing(6)
         self.tb_lay = tb
+        self.apply_toolbar_margins()
         self.btn_side = ToolIcon("sidebar", "Toggle sidebar  (Ctrl+B)", self.toggle_sidebar)
         self.btn_back = ToolIcon("back", "Back  (Alt+←)", lambda: self.cur().back())
         self.btn_fwd = ToolIcon("forward", "Forward  (Alt+→)", lambda: self.cur().forward())
@@ -6061,7 +8633,7 @@ class Browser(QMainWindow):
         self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self.completer.setMaxVisibleItems(8)
-        self.completer.popup().setStyleSheet(themed(POPUP_QSS))
+        self.completer.popup().setStyleSheet(themed(popup_qss()))
         self.completer.activated[str].connect(
             lambda t: (self.addr.setText(t), QTimer.singleShot(0, self.navigate)))
         self.addr.setCompleter(self.completer)
@@ -6076,7 +8648,7 @@ class Browser(QMainWindow):
         self.btn_menu = ToolIcon("dots", "Menu", self.show_menu)
         self.drag_zone = QWidget()  # a bit of bare toolbar to grab and drag the window by
         self.drag_zone.setFixedWidth(4)
-        self.winctl = WindowControls(self, self.settings.get("winbtns", default_winbtns()))
+        self.winctl = WindowControls(self, effective_winbtns(self.settings))
         self.winctl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.winctl.customContextMenuRequested.connect(
             lambda pos: self.winbtn_menu().exec(self.winctl.mapToGlobal(pos)))
@@ -6154,7 +8726,12 @@ class Browser(QMainWindow):
         """Keep margins, resize grips and window buttons in step with normal / maximised / full-screen."""
         if not hasattr(self, "winctl"):
             return
-        m = 0 if (self.isMaximized() or self.isFullScreen()) else 8
+        if self.isFullScreen():
+            m = 0
+        elif self.isMaximized():
+            m = 6 if UI["mode"] == "mac" else 0  # the floating glass needs a little air even when maximised
+        else:
+            m = frame_margin()
         self.centralWidget().layout().setContentsMargins(m, m, m, m)
         self.place_grips()
         self.winctl.sync()
@@ -6173,20 +8750,138 @@ class Browser(QMainWindow):
         else:
             self.showMaximized()
 
+    def apply_toolbar_margins(self):
+        """The macOS style gives the toolbar a little side padding."""
+        if UI["mode"] == "mac":
+            self.tb_lay.setContentsMargins(6, 3, 6, 3)
+        else:
+            self.tb_lay.setContentsMargins(0, 0, 0, 0)
+
     def set_winbtns(self, mode):
         mode = "mac" if mode == "mac" else "windows"
         self.settings["winbtns"] = mode
         jsave("settings.json", self.settings)
-        self.winctl.set_mode(mode)
+        self.winctl.set_mode(effective_winbtns(self.settings))
 
     def winbtn_menu(self, parent=None):
-        m = QMenu("Window buttons", parent or self)
+        locked = UI["mode"] != "default"  # the macOS / Windows styles pick their own buttons
+        m = QMenu("Window buttons" + ("  (set by interface style)" if locked else ""), parent or self)
+        cur = effective_winbtns(self.settings)
         for key, label in (("windows", "Windows style"), ("mac", "macOS style")):
             a = m.addAction(label)
             a.setCheckable(True)
-            a.setChecked(self.winctl.mode == key)
+            a.setChecked(cur == key)
+            a.setEnabled(not locked)
             a.triggered.connect(lambda _c, k=key: self.set_winbtns(k))
         return m
+
+    # ----- interface style: default / macOS / Windows -----
+    def style_menu(self, parent=None):
+        m = QMenu("Interface style", parent or self)
+        for key, _name in UI_MODES:
+            a = m.addAction(UI_LABELS[key])
+            a.setCheckable(True)
+            a.setChecked(UI["mode"] == key)
+            a.triggered.connect(lambda _c, k=key: self.set_ui_style(k))
+        return m
+
+    def _style_snapshot(self):
+        """Grab the window as it looks now, so switching style can cross-fade instead of jumping."""
+        try:
+            if not self.isVisible() or self.isMinimized() or self.windowOpacity() < 1.0:
+                return None
+            pm = self.screen().grabWindow(int(self.winId()))
+        except Exception:
+            return None
+        if pm.isNull():
+            return None
+        root = self.centralWidget()
+        lab = QLabel(root)
+        lab.setPixmap(pm)
+        lab.setScaledContents(True)
+        lab.setGeometry(root.rect())
+        lab.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        lab.show()
+        lab.raise_()
+        return lab
+
+    def set_ui_style(self, mode, refresh_settings=True):
+        """Switch between the Default, macOS (Safari-like liquid glass) and Windows (Windows 11) interface styles."""
+        mode = valid_ui_mode(mode)
+        self.settings["ui_style"] = mode
+        jsave("settings.json", self.settings)
+        if mode == UI["mode"]:
+            return
+        shot = self._style_snapshot()
+        UI["mode"] = mode
+        self.winctl.set_mode(effective_winbtns(self.settings))
+        QApplication.instance().setStyleSheet(themed(app_qss()))
+        self.completer.popup().setStyleSheet(themed(popup_qss()))
+        self.addr.refresh_style()
+        self.apply_toolbar_margins()
+        self.tb_ed.apply()
+        self.sync_frame()
+        for w in self.findChildren(QWidget):
+            w.update()
+        self.refresh_start_pages()
+        if refresh_settings:
+            for t in self.tab_list():
+                if t.url().scheme() == "fjord" and t.url().host() == "settings":
+                    t.setHtml(settings_html(self), QUrl("fjord://settings"))
+        if shot is not None:
+            fx = QGraphicsOpacityEffect(shot)
+            shot.setGraphicsEffect(fx)
+            animate(fx, b"opacity", 1.0, 0.0, 560 if mode == "mac" else 280, done=shot.deleteLater)
+
+    def set_accent(self, pair, fade=True):
+        """Set the accent colour (a (main, alt) pair), or None to go back to following the background. The whole UI crossfades."""
+        if pair:
+            self.settings["accent"] = {"main": pair[0], "alt": pair[1]}
+        else:
+            self.settings.pop("accent", None)
+        jsave("settings.json", self.settings)
+        shot = self._style_snapshot() if fade else None
+        self.apply_bg_globals()
+        self.addr.refresh_style()
+        self.tb_ed.apply()
+        self.sync_frame()
+        for w in self.findChildren(QWidget):
+            w.update()
+        self.refresh_start_pages()
+        for t in self.tab_list():
+            if t.url().scheme() == "fjord" and t.url().host() == "settings":
+                t.setHtml(settings_html(self), QUrl("fjord://settings"))
+        if shot is not None:
+            fx = QGraphicsOpacityEffect(shot)
+            shot.setGraphicsEffect(fx)
+            animate(fx, b"opacity", 1.0, 0.0, 560, done=shot.deleteLater)
+
+    def start_tour(self):
+        """The welcome tour: import, accent colour, layout and a run through the features."""
+        if self.tour is not None:
+            return
+        self.tour = WelcomeTour(self, self.centralWidget())
+        self.tour.closed.connect(self._tour_closed)
+        self.tour.start()
+
+    def _tour_closed(self):
+        self.tour = None
+        self.settings["tour_done"] = True
+        jsave("settings.json", self.settings)
+        self.focus_address()
+
+    def apply_ui_tuning(self):
+        """Re-apply the corner-radius / glass sliders everywhere, without switching interface style."""
+        load_ui_tuning(self.settings)
+        QApplication.instance().setStyleSheet(themed(app_qss()))
+        self.completer.popup().setStyleSheet(themed(popup_qss()))
+        self.addr.refresh_style()
+        self.apply_toolbar_margins()
+        self.tb_ed.apply()
+        self.sync_frame()
+        for w in self.findChildren(QWidget):
+            w.update()
+        self.refresh_start_pages()
 
     def _tool(self, text, slot):
         b = FadeButton()
@@ -6417,6 +9112,7 @@ class Browser(QMainWindow):
             self.progress.setValue(t.prog)
             self.progress.setVisible(t.loading)
             self.sync_chrome(t)
+            self.budget_overlay_sync()
             g = self.group_by_id(t.group) if t.group else None
             if g and g["collapsed"]:  # landing on a tab inside a shut island slides it open
                 self.set_group_open(g, True)
@@ -6635,6 +9331,8 @@ class Browser(QMainWindow):
             self.hoverbar.place()
         if hasattr(self, "scratch"):
             self.scratch.place()
+        if hasattr(self, "budget_ov") and self.budget_ov.isVisible():
+            self.budget_ov.place()
         self.place_grips()
 
     # ----- actions -----
@@ -6657,10 +9355,10 @@ class Browser(QMainWindow):
         t.setZoomFactor(max(0.25, min(5.0, t.zoomFactor() + d)))
 
     def extent(self):
-        return 170 if self.horiz else 40
+        return 180 if self.horiz else 40
 
     def item_size(self, v):
-        return QSize(v, 40) if self.horiz else QSize(0, v)
+        return QSize(v, 38) if self.horiz else QSize(0, v)
 
     def side_width(self):
         return 64 if self.compact else self.sidebar_w
@@ -6746,19 +9444,24 @@ class Browser(QMainWindow):
         st = self.settings
         self.horiz = st.get("layout") == "horizontal"
         self.compact = bool(st.get("compact")) and not self.horiz
-        for w in (self.ess_wrap, self.divider, self.group_wrap, self.newtab, self.tabs, self.scratch_btn, self.player):
+        for w in (self.ess_wrap, self.divider, self.group_wrap, self.newtab, self.tabs, self.scratch_btn, self.player,
+                  self.strip_fill):
             self.side_lay.removeWidget(w)
             self.strip_lay.removeWidget(w)
         self.tb_lay.removeWidget(self.scratch_btn)
         if self.horiz:
-            for w, k in ((self.ess_wrap, 0), (self.group_wrap, 0), (self.tabs, 1), (self.newtab, 0)):
+            for w, k in ((self.ess_wrap, 0), (self.group_wrap, 0), (self.tabs, 0), (self.newtab, 0), (self.strip_fill, 1)):
                 self.strip_lay.addWidget(w, k)
             self.tabs.setFlow(QListView.Flow.LeftToRight)
             self.tabs.setWrapping(False)
-            self.tabs.setSpacing(3)
-            self.tabs.setFixedHeight(50)
+            self.tabs.setSpacing(0)
+            self.tabs.setFixedHeight(38)
+            self.tabs.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             self.newtab.setText("＋")
-            self.newtab.setFixedWidth(40)
+            self.newtab.setFixedSize(32, 30)
+            self.newtab.setProperty("compact", True)  # flat Chrome-style + button
+            self.newtab.style().unpolish(self.newtab)
+            self.newtab.style().polish(self.newtab)
             self.strip.show()
             self.side.hide()
             self.edge.hide()
@@ -6771,8 +9474,9 @@ class Browser(QMainWindow):
             self.tabs.setSpacing(0)
             self.tabs.setMinimumHeight(0)
             self.tabs.setMaximumHeight(16777215)
-            self.newtab.setMinimumWidth(0)
-            self.newtab.setMaximumWidth(16777215)
+            self.tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.newtab.setMinimumSize(0, 0)
+            self.newtab.setMaximumSize(16777215, 16777215)
             self.newtab.setText("＋" if self.compact else "＋  New tab")
             self.newtab.setProperty("compact", self.compact)
             self.newtab.style().unpolish(self.newtab)
@@ -6793,6 +9497,10 @@ class Browser(QMainWindow):
                 self.side.setFixedWidth(tw)
                 self.side.hide()
                 self.edge.setVisible(bool(st.get("autohide")))
+        self.tabs.setProperty("horiz", self.horiz)
+        self.tabs.style().unpolish(self.tabs)
+        self.tabs.style().polish(self.tabs)
+        self.tabs.updateGeometry()
         self.player.set_compact(self.compact)
         self.scratch_btn.set_mode(self.compact, self.horiz)
         self.scratch_btn.show()
@@ -6822,6 +9530,16 @@ class Browser(QMainWindow):
             st[k] = v
         elif k == "winbtns" and v in ("windows", "mac"):
             st[k] = v
+        elif k == "ui_style" and v in dict(UI_MODES):
+            self.set_ui_style(v, refresh_settings=False)  # the settings page is redrawn below
+        elif k in TUNE and v.lstrip("-").isdecimal():
+            _n, lo, hi, _d = TUNE[k]
+            st[k] = max(lo, min(hi, int(v)))
+            self.apply_ui_tuning()
+        elif k == "ui_reset":
+            for key in TUNE:
+                st.pop(key, None)
+            self.apply_ui_tuning()
         elif k == "engine" and v in ENGINES:
             self.set_engine(v)
         elif k == "font" and v in installed_fonts():
@@ -6833,11 +9551,15 @@ class Browser(QMainWindow):
             self.update_greeting(text=text, mode="custom" if text else "default")
         elif k == "greet_pick":
             self.update_greeting(mode="quote", pick=int(v) if v.isdecimal() and int(v) < len(QUOTES) else None)
+        elif k == "tour":
+            QTimer.singleShot(0, self.start_tour)
+        elif k == "accent_reset":
+            self.set_accent(None)
         jsave("settings.json", st)
         if k in ("compact", "layout"):
             self.apply_layout()
         elif k == "winbtns":
-            self.winctl.set_mode(v)
+            self.winctl.set_mode(effective_winbtns(st))
         elif k == "visualizer":
             self.player.set_viz(bool(st["visualizer"]))
         elif k == "autohide":
@@ -7335,7 +10057,7 @@ class Browser(QMainWindow):
         if on:
             self.tb_ed.stop()
         self.toolbar.setVisible(not on)
-        m = 0 if on else 8
+        m = 0 if on else frame_margin()
         self.centralWidget().layout().setContentsMargins(m, m, m, m)
         self.showFullScreen() if on else self.showNormal()
 
@@ -7405,11 +10127,83 @@ class Browser(QMainWindow):
 
     def open_bookmarks(self):
         e = html.escape
-        rows = "".join(
-            f'<div class=r><a href="{e(b["url"], True)}"><b>{e(b["title"])}</b><small>{e(b["url"])}</small></a>'
-            f'<a class=x href="fjord://remove-bookmark?u={quote(b["url"], safe="")}">✕</a></div>'
-            for b in self.bookmarks)
-        self.show_page("bookmarks", list_page("Bookmarks", rows))
+        groups = {}
+        for b in self.bookmarks:  # grouped by folder, in the order each folder first appears; unfiled ones come first
+            groups.setdefault(b.get("folder") or "", []).append(b)
+        rows = ""
+        for folder in sorted(groups, key=lambda f: f != ""):
+            if folder or len(groups) > 1:
+                rows += '<div class=fh>%s</div>' % e(folder or "Bookmarks")
+            for b in groups[folder]:
+                rows += (f'<div class=r><a href="{e(b["url"], True)}"><b>{e(b["title"])}</b><small>{e(b["url"])}</small></a>'
+                         f'<a class=x href="fjord://remove-bookmark?u={quote(b["url"], safe="")}">\u2715</a></div>')
+        if len(self.bookmarks) > 8:
+            rows = ('<input id=q placeholder="Search bookmarks\u2026" autocomplete=off style="width:100%;box-sizing:border-box;padding:11px 16px;'
+                    'border-radius:99px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.06);color:inherit;font:inherit;'
+                    'outline:none;margin:4px 0 8px">' + rows
+                    + "<script>var q=document.getElementById('q');q.addEventListener('input',function(){var v=q.value.toLowerCase();"
+                      "document.querySelectorAll('.r').forEach(function(r){r.style.display=r.textContent.toLowerCase().indexOf(v)<0?'none':'';});"
+                      "document.querySelectorAll('.fh').forEach(function(h){var n=h.nextElementSibling,any=false;"
+                      "while(n&&!n.classList.contains('fh')){if(n.style.display!=='none')any=true;n=n.nextElementSibling;}"
+                      "h.style.display=any?'':'none';});});</script>")
+        self.show_page("bookmarks", list_page("Bookmarks", rows, '<a href="fjord://import-open">Import</a>'))
+
+    # ----- importing from other browsers -----
+    def open_import(self):
+        self._import_sources = detect_import_sources()
+        self.show_page("import", import_html(self._import_sources))
+
+    def run_import(self, src, with_history):
+        if self._import_busy:
+            return
+        self._import_busy = True
+        self.toast("Importing from %s\u2026" % src["name"], 60000)
+        self.importer.run(src, with_history)
+
+    def import_from_file(self):
+        path, _f = QFileDialog.getOpenFileName(self, "Import bookmarks", str(Path.home()),
+                                               "Bookmarks files (*.html *.htm);;All files (*)")
+        if path:
+            self.run_import({"kind": "html", "path": path, "name": Path(path).name}, False)
+
+    def on_import_failed(self, msg):
+        self._import_busy = False
+        if self._import_hook:
+            self._import_hook(False, msg)
+            return
+        self.toast(msg, 9000)
+
+    def on_import_done(self, res):
+        self._import_busy = False
+        have = {b["url"] for b in self.bookmarks}
+        added = 0
+        for b in res["bookmarks"]:
+            if b["url"] not in have:
+                have.add(b["url"])
+                self.bookmarks.append(b)
+                added += 1
+        seen = {h["url"] for h in self.history}
+        new_hist = [h for h in res["history"] if h["url"] not in seen]
+        if new_hist:
+            self.history = sorted(self.history + new_hist, key=lambda h: h.get("t", 0))[-3000:]
+            jsave("history.json", self.history)
+        if added:
+            jsave("bookmarks.json", self.bookmarks)
+        self.refresh_completer()
+        parts = []
+        if added:
+            parts.append("%d bookmark%s" % (added, "" if added == 1 else "s"))
+        if new_hist:
+            parts.append("%d history entries" % len(new_hist))
+        msg = ("Imported %s from %s" % (" and ".join(parts), res["name"])) if parts else "Nothing new to import from %s" % res["name"]
+        if res["notes"]:
+            msg += ". " + " ".join(res["notes"])
+        if self._import_hook:  # the welcome tour is running this import and reports the result itself
+            self._import_hook(True, msg)
+            return
+        self.toast(msg, 9000)
+        if added:
+            self.open_bookmarks()
 
     def internal_action(self, url):
         if url.host() == "search":
@@ -7458,6 +10252,18 @@ class Browser(QMainWindow):
             self.remove_top_site(parse_qs(url.query()).get("h", [""])[0])
         elif url.host().startswith("ext-"):
             self.ext_action(url)
+        elif url.host() in ("budget-add", "budget-set", "budget-remove"):
+            self.budget_action(url)
+        elif url.host() == "import-open":
+            self.open_import()
+        elif url.host() == "import-run":
+            q = parse_qs(url.query())
+            try:
+                self.run_import(self._import_sources[int(q.get("i", ["-1"])[0])], q.get("h", ["0"])[0] == "1")
+            except (ValueError, IndexError):
+                pass
+        elif url.host() == "import-file":
+            self.import_from_file()
         elif url.host() == "clear-history":
             self.history = []
             jsave("history.json", [])
@@ -7705,12 +10511,15 @@ class Browser(QMainWindow):
               and conf.get("accent_v") == ACCENT_ALGO):
             src = conf["accent"]
         pair = derive_accent(src, 0.3 if kind == "color" else 0.2) if src else None
+        mine = self.settings.get("accent")  # an accent picked in the welcome tour wins over the background's
+        if isinstance(mine, dict) and all(re.fullmatch(r"#[0-9a-fA-F]{6}", str(mine.get(k, ""))) for k in ("main", "alt")):
+            pair = (mine["main"].lower(), mine["alt"].lower())
         ACCENT["main"], ACCENT["alt"] = pair if pair else (DEFAULT_ACCENT["main"], DEFAULT_ACCENT["alt"])
         app = QApplication.instance()
         if app is not None:
-            app.setStyleSheet(themed(QSS))
+            app.setStyleSheet(themed(app_qss()))
             if hasattr(self, "completer"):
-                self.completer.popup().setStyleSheet(themed(POPUP_QSS))
+                self.completer.popup().setStyleSheet(themed(popup_qss()))
 
     def bg_for_start(self):
         conf = self.settings.get("bg") if isinstance(self.settings.get("bg"), dict) else {}
@@ -7932,7 +10741,7 @@ class Browser(QMainWindow):
             b = FadeButton(12)
             b.setObjectName("essential")
             b.setCheckable(True)
-            b.setFixedSize(*((40, 36) if self.horiz else ((44, 44) if self.compact else (46, 40))))
+            b.setFixedSize(*((34, 30) if self.horiz else ((44, 44) if self.compact else (46, 40))))
             b.setToolTip(e["title"])
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             icon_path = ICON_DIR / f"{e['host']}.png"
@@ -7996,7 +10805,225 @@ class Browser(QMainWindow):
     def toolbar_menu(self, pos):
         m = QMenu(self)
         m.addAction("Customize toolbar…", self.tb_ed.start)
+        m.addMenu(self.style_menu(m))
         m.exec(self.toolbar.mapToGlobal(pos))
+
+    # ----- updates -----
+    def check_updates(self, manual=True):
+        if self._update_busy:
+            return
+        self._update_busy = True
+        self._update_manual = manual
+        if manual:
+            self.toast("Checking for updates…", 3000)
+        self.updater.check()
+
+    def set_auto_update(self, on):
+        self.settings["auto_update"] = bool(on)
+        jsave("settings.json", self.settings)
+
+    def set_scratch_popup(self, on):
+        self.settings["scratch_popup"] = bool(on)
+        jsave("settings.json", self.settings)
+        self.toast("Scratchpad %s when you drag something" % ("pops up" if on else "stays put"), 2500)
+
+    def on_update_uptodate(self):
+        self._update_busy = False
+        if self._update_manual:
+            self.toast("Fjord is up to date (v%s)" % APP_VERSION, 4000)
+
+    def on_update_failed(self, msg):
+        self._update_busy = False
+        if self._update_manual:
+            self.toast(msg, 8000)
+
+    def on_update_found(self, info):
+        box = QMessageBox(self)
+        box.setWindowTitle("Fjord update")
+        box.setText("Fjord %s is available (you have %s).\nUpdate and restart now?" % (info["version"], APP_VERSION))
+        if info.get("notes"):  # release notes shown as plain text (the built-in "Show Details" button gets clipped by our styling)
+            n = info["notes"]
+            box.setInformativeText(n if len(n) <= 400 else n[:400].rstrip() + "…")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            self.toast("Downloading Fjord %s…" % info["version"], 60000)
+            self.updater.install(info)
+        else:
+            self._update_busy = False
+
+    def on_update_installed(self, version):
+        self._update_busy = False
+        self.toast("Updated to Fjord %s, restarting…" % version, 4000)
+        QTimer.singleShot(900, self.restart_app)
+
+    def restart_app(self):
+        frozen = getattr(sys, "frozen", False)
+        p = QProcess()
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("FJORD_RESTARTED", "1")  # tells the new copy to wait a moment for this one to release the profile
+        p.setProcessEnvironment(env)
+        p.setProgram(sys.executable)
+        p.setArguments([] if frozen else [str(_app_path())])
+        p.startDetached()
+        self.close()
+        QApplication.quit()
+
+    # ----- site time budgets -----
+    def _budgets_load(self):
+        d = jload("budgets.json", {})
+        if not isinstance(d, dict):
+            d = {}
+        lim = {}
+        for k, v in (d.get("limits") or {}).items() if isinstance(d.get("limits"), dict) else []:
+            try:
+                if norm_site(k) == k and 1 <= int(v) <= 1440:
+                    lim[k] = int(v)
+            except (TypeError, ValueError):
+                pass
+        out = {"limits": lim, "day": str(d.get("day") or ""), "used": {}, "extra": {}, "off": []}
+        for key in ("used", "extra"):
+            if isinstance(d.get(key), dict):
+                out[key] = {k: float(v) for k, v in d[key].items() if isinstance(v, (int, float))}
+        if isinstance(d.get("off"), list):
+            out["off"] = [k for k in d["off"] if isinstance(k, str)]
+        return out
+
+    def budget_save(self):
+        jsave("budgets.json", self.budgets)
+
+    def budget_key(self, host):
+        """Which budgeted site (if any) this host belongs to, e.g. m.youtube.com -> youtube.com."""
+        host = (host or "").lower()
+        host = host[4:] if host.startswith("www.") else host
+        best = None
+        for k in self.budgets["limits"]:
+            if (host == k or host.endswith("." + k)) and (best is None or len(k) > len(best)):
+                best = k
+        return best
+
+    def budget_over_key(self, host):
+        k = self.budget_key(host)
+        bd = self.budgets
+        if k and k not in bd["off"] and bd["used"].get(k, 0) >= bd["limits"][k] * 60 + bd["extra"].get(k, 0):
+            return k
+        return None
+
+    def budget_tick(self):
+        try:
+            now = time.monotonic()
+            dt = min(now - self._b_last, 3.0)  # a long gap means the computer slept; don't count it
+            self._b_last = now
+            bd = self.budgets
+            today = datetime.date.today().isoformat()
+            if bd["day"] != today:
+                bd.update(day=today, used={}, extra={}, off=[])
+                self._b_warned = set()
+                self.budget_save()
+            if bd["limits"]:
+                cur = self.cur()
+                active = self.isActiveWindow() and not self.isMinimized() and os_idle_seconds() < 180
+                keys = set()
+                for w in self.tab_list():
+                    if w.closing or self.is_internal(w.url()):
+                        continue
+                    audible = w.page().recentlyAudible()
+                    if audible or (w is cur and active):
+                        k = self.budget_key(w.url().host())
+                        if k:
+                            keys.add(k)
+                            if audible and self.budget_over_key(w.url().host()):
+                                w.page().runJavaScript(BUDGET_PAUSE_JS)  # over the limit: stop media playing in the background
+                for k in keys:
+                    bd["used"][k] = bd["used"].get(k, 0) + dt
+                    total = bd["limits"][k] * 60 + bd["extra"].get(k, 0)
+                    if total - bd["used"][k] <= 300 and bd["limits"][k] >= 10 and (k, total) not in self._b_warned and bd["used"][k] < total:
+                        self._b_warned.add((k, total))
+                        self.toast("5 minutes left on %s today" % k, 6000)
+                self._b_ticks += 1
+                if keys and self._b_ticks % 15 == 0:
+                    self.budget_save()
+            self.budget_overlay_sync()
+        except Exception:
+            pass  # never let the timer take the browser down
+
+    def budget_overlay_sync(self):
+        if not hasattr(self, "budget_ov"):
+            return
+        t = self.cur()
+        k = None
+        if t is not None and self.budgets["limits"] and not self.is_internal(t.url()):
+            k = self.budget_over_key(t.url().host())
+        if k:
+            newly = self.budget_ov.show_for(k, int(self.budgets["used"].get(k, 0) / 60), self.budgets["limits"][k])
+            if newly:
+                t.page().runJavaScript(BUDGET_PAUSE_JS)
+        elif self.budget_ov.isVisible():
+            self.budget_ov.hide()
+
+    def budget_more(self):
+        k = self.budget_ov.key
+        if k:
+            self.budgets["extra"][k] = self.budgets["extra"].get(k, 0) + 300
+            self.budget_save()
+            self.budget_overlay_sync()
+            self.toast("5 more minutes on %s" % k, 3000)
+
+    def budget_skip(self):
+        k = self.budget_ov.key
+        if k and k not in self.budgets["off"]:
+            self.budgets["off"].append(k)
+            self.budget_save()
+            self.budget_overlay_sync()
+            self.toast("No limit on %s for the rest of today" % k, 4000)
+
+    def budget_close(self):
+        t = self.cur()
+        if t is not None:
+            self.close_tab(t)
+        self.budget_overlay_sync()
+
+    def open_budgets(self):
+        t = self.cur()
+        self._b_suggest = norm_site(t.url().host()) if t is not None and not self.is_internal(t.url()) else ""
+        self.show_page("budgets", budgets_html(self))
+
+    def budget_action(self, url):
+        h = url.host()
+        q = parse_qs(url.query())
+        g = lambda k: q.get(k, [""])[0]
+        bd = self.budgets
+        if h == "budget-add":
+            site = norm_site(g("site"))
+            try:
+                m = int(float(g("min")))
+            except ValueError:
+                m = 0
+            if not site:
+                self.toast("Enter a site like youtube.com", 4000)
+            elif not 1 <= m <= 1440:
+                self.toast("Minutes per day must be between 1 and 1440", 4000)
+            else:
+                bd["limits"][site] = m
+                self.toast("%s: %d min a day" % (site, m), 3000)
+        elif h == "budget-set":
+            site = norm_site(g("h"))
+            try:
+                d = int(g("d"))
+            except ValueError:
+                d = 0
+            if site in bd["limits"]:
+                bd["limits"][site] = max(1, min(1440, bd["limits"][site] + d))
+        elif h == "budget-remove":
+            site = norm_site(g("h"))
+            bd["limits"].pop(site, None)
+            bd["used"].pop(site, None)
+            bd["extra"].pop(site, None)
+            if site in bd["off"]:
+                bd["off"].remove(site)
+        self.budget_save()
+        self.budget_overlay_sync()
+        self.show_page("budgets", budgets_html(self))
 
     def show_menu(self):
         m = QMenu(self)
@@ -8007,6 +11034,7 @@ class Browser(QMainWindow):
         m.addAction("Bookmarks\tCtrl+Shift+O", self.open_bookmarks)
         m.addAction("History\tCtrl+H", self.open_history)
         m.addAction("Extensions", self.open_extensions)
+        m.addAction("Import from another browser…", self.open_import)
         m.addAction("Open downloads folder", lambda: QDesktopServices.openUrl(
             QUrl.fromLocalFile(str(Path.home() / "Downloads"))))
         m.addSeparator()
@@ -8014,41 +11042,65 @@ class Browser(QMainWindow):
         m.addAction("Save page as PDF\tCtrl+P", self.print_pdf)
         m.addAction("View page source", lambda: self.new_tab("view-source:" + self.cur().url().toString())
                     if not self.is_internal(self.cur().url()) else None)
-        m.addAction("Zoom in", lambda: self.zoom(0.1))
-        m.addAction("Zoom out", lambda: self.zoom(-0.1))
-        m.addAction("Reset zoom", lambda: self.cur().setZoomFactor(1.0))
+        if self.stack.split:
+            m.addAction("Exit split view", lambda _c=False: self.exit_split())
         m.addSeparator()
-        sub = m.addMenu("Search engine")
+
+        # ----- View & appearance -----
+        view = m.addMenu("View && appearance")
+        view.addAction("Zoom in", lambda: self.zoom(0.1))
+        view.addAction("Zoom out", lambda: self.zoom(-0.1))
+        view.addAction("Reset zoom", lambda: self.cur().setZoomFactor(1.0))
+        view.addAction("Fullscreen\tF11", self.toggle_fullscreen)
+        view.addSeparator()
+        sub = view.addMenu("Search engine")
         for name in ENGINES:
             a = sub.addAction(engine_icon(name), name)
             a.setCheckable(True)
             a.setChecked(name == self.engine)
             a.triggered.connect(lambda _c, n=name: self.set_engine(n))
-        fsub = m.addMenu("Font")
+        fsub = view.addMenu("Font")
         for fam in installed_fonts():
             fa = fsub.addAction(fam)
             fa.setCheckable(True)
             fa.setChecked(fam == CUR_FONT["family"])
             fa.triggered.connect(lambda _c, n=fam: self.set_font(n))
-        m.addAction("Fullscreen\tF11", self.toggle_fullscreen)
-        m.addMenu(self.winbtn_menu(m))
-        if self.stack.split:
-            m.addAction("Exit split view", lambda _c=False: self.exit_split())
-        sl = m.addAction("Sleep background tabs (saves memory)")
-        sl.setCheckable(True)
-        sl.setChecked(bool(self.settings.get("sleep_tabs", True)))
-        sl.triggered.connect(lambda _c: self.set_sleep_tabs(not self.settings.get("sleep_tabs", True)))
-        ab = m.addAction("Block ads & trackers")
+        sp = view.addAction("Pop up Scratchpad when dragging")
+        sp.setCheckable(True)
+        sp.setChecked(bool(self.settings.get("scratch_popup", True)))
+        sp.triggered.connect(lambda _c: self.set_scratch_popup(not self.settings.get("scratch_popup", True)))
+        view.addMenu(self.style_menu(view))
+        view.addMenu(self.winbtn_menu(view))
+        view.addAction("Customize toolbar…", self.tb_ed.start)
+
+        # ----- Privacy & performance -----
+        priv = m.addMenu("Privacy && performance")
+        ab = priv.addAction("Block ads && trackers")
         ab.setCheckable(True)
         ab.setChecked(self.adblock.enabled)
         ab.triggered.connect(lambda _c: self.set_adblock(not self.adblock.enabled))
         site = self.host_of(self.cur().url())
         if site and not self.is_internal(self.cur().url()):
             paused = site in self.adblock.allow
-            m.addAction(("Resume" if paused else "Pause") + " ad blocking on " + site,
-                        lambda: self.pause_site(site, not paused))
-        m.addAction("Customize toolbar…", self.tb_ed.start)
-        m.addAction("VPN / Proxy…", lambda: self.open_settings())
+            priv.addAction(("Resume" if paused else "Pause") + " ad blocking on " + site,
+                           lambda: self.pause_site(site, not paused))
+        sl = priv.addAction("Sleep background tabs (saves memory)")
+        sl.setCheckable(True)
+        sl.setChecked(bool(self.settings.get("sleep_tabs", True)))
+        sl.triggered.connect(lambda _c: self.set_sleep_tabs(not self.settings.get("sleep_tabs", True)))
+        priv.addAction("Site time budgets…", self.open_budgets)
+        priv.addAction("VPN / Proxy…", lambda: self.open_settings())
+
+        # ----- Updates -----
+        upd = m.addMenu("Updates")
+        upd.addAction("Check for updates… (v%s)" % APP_VERSION, lambda: self.check_updates(True))
+        au = upd.addAction("Check for updates on launch")
+        au.setCheckable(True)
+        au.setChecked(bool(self.settings.get("auto_update", True)))
+        au.triggered.connect(lambda _c: self.set_auto_update(not self.settings.get("auto_update", True)))
+
+        m.addSeparator()
+        m.addAction("Welcome tour…", self.start_tour)
         m.addAction("Settings\tCtrl+,", lambda: self.open_settings())
         m.addAction("Quit", self.close)
         m.exec(self.btn_menu.mapToGlobal(self.btn_menu.rect().bottomLeft()))
@@ -8097,6 +11149,7 @@ class Browser(QMainWindow):
         QTimer.singleShot(400, go)
 
     def closeEvent(self, e):
+        self.budget_save()
         if self._restored:
             self.save_groups()
         while self.stack.count():
@@ -8116,11 +11169,16 @@ def main():
     if sys.platform == "win32":
         import ctypes  # gives Fjord its own taskbar identity so the icon shows instead of python.exe's
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("fjord.browser.1")
+    if os.environ.pop("FJORD_RESTARTED", None):
+        time.sleep(2.5)  # we were relaunched by the updater: give the old process time to exit
+    cleanup_old_update()
     app = QApplication(sys.argv)
     app.setApplicationName("Fjord")
     app.setWindowIcon(QIcon(resource_path("fjord.ico")))
     DATA_DIR.mkdir(exist_ok=True)
     load_custom_fonts()
+    UI["mode"] = valid_ui_mode(jload("settings.json", {}).get("ui_style"))
+    load_ui_tuning(jload("settings.json", {}))
     apply_font(app, pick_font(jload("settings.json", {}).get("font")))
     win = Browser()
     win.setWindowOpacity(0.0)
