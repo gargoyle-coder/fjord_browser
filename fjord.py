@@ -109,7 +109,7 @@ from PyQt6.QtWidgets import (
 
 # ----- auto-update -----
 # Bump APP_VERSION on every release so it matches the GitHub release tag (tag "v1.2.0" or "1.2.0" -> "1.2.0").
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.3.0"
 GITHUB_REPO = "gargoyle-coder/fjord_browser"      # <- change to "owner/repo" of your GitHub repository
 UPDATE_ASSET = "fjord.py"                # name of the file attached to each release (falls back to the file at the release tag)
 
