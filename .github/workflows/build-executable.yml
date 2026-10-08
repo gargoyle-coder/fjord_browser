@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     # Inputs the workflow accepts.
     inputs:
-      name:
+      version:
         # Friendly description to be shown in the UI instead of 'name'
         description: 'Version Number'
         # Default value if no value is explicitly provided
@@ -48,5 +48,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: executable-${{ matrix.os }}
+          name: ${{ matrix.os }}-executable-v${{ inputs.version }}
           path: dist/*
