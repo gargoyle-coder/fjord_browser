@@ -22,8 +22,9 @@ body:
       label: Version
       description: What version of our software are you running?
       options:
-        - 1.0.2 (Default)
-        - 1.0.3 (Edge)
+        - v0.3.0-alpha
+        - v0.2.0-alpha
+        - v0.1.0-alpha
       default: 0
     validations:
       required: true
@@ -33,7 +34,7 @@ body:
       label: Steps to recreate issue
       description: Please give the steps that were taken to cause this bug; so that we can help fix it more quickly!
       render: shell
-      placeholder: Step 1: ...
+      placeholder: Step 1) ...
   - type: upload
     id: screenshots
     attributes:
