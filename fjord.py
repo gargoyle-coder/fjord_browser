@@ -22,11 +22,12 @@ Keyboard & mouse: Settings > Keyboard & mouse. Click "+ Add" next to any action 
     middle button and the side buttons do on the interactive mouse (click a button on the drawing, or press it on your real mouse;
     links still open in a new tab on middle-click). The side buttons go back and forward unless you choose otherwise
 Drag the sidebar's right edge to resize it (double-click resets) · right-click the media player for options
-Scratchpad (Ctrl+Shift+S): drag images, files, text or links toward the window and it pops open to catch them; copy or save them again later
+Scratchpad (Ctrl+Shift+S): drag images, files, text or links toward the window and it pops open to catch them; copy or save them again later.
+    Anything you copy (Ctrl+C) is added to it automatically too; turn that off in Settings > Features > Scratchpad (copied passwords are never kept)
 Chat (Ctrl+Shift+M, or the speech bubble beside the Scratchpad): talk to other Fjord users on the same network; send files, the page you're on or Scratchpad items; shared pinboard.
     Optional room code groups (and, with the cryptography package, encrypts) a chat. Nothing goes through a server.
 Downloads (Ctrl+J): a shelf slides up with live progress, speed and time left; it flags disguised files, can sort by type, and keeps a history
-Camera & microphone: when a site asks, a bar slides in with Block / Allow once / Allow (✕ dismisses it); Block and Allow are remembered per site.
+Site permissions (camera, microphone, location, notifications, clipboard, pointer lock, local fonts): when a site asks, a bar glides in with Block / Allow once / Allow (✕ dismisses it); Block and Allow are remembered per site. The bar has its own Default, macOS, Windows and Terminal look.
     Forget them again from ⋯ menu > Privacy > Reset saved site permissions
 Tab sound icon: click the little speaker on a playing tab to mute it; rest the pointer on it and a volume slider slides out (drag it, or scroll the wheel)
 Sticky notes: click the little note button at the bottom right of any site to pin a note there (saved in ~/.fjord_browser/notes.json)
@@ -46,7 +47,14 @@ Settings are grouped into categories (Appearance, Tabs & sidebar, Speed & memory
 Default browser: ⋯ menu > Set Fjord as default browser (or Settings > General). Fjord also offers it at launch when it isn't the default;
     links from other apps then open in the running window instead of starting a second Fjord
 Ad blocking: uBlock Origin + EasyList filter lists, with scriptlets, procedural hiding, $important/$badfilter/$document, malware-page blocking and automatic list refresh (Settings > Search & privacy)
+History randomiser (off by default): shield popup, Settings > Search & privacy, or ⋯ menu > Privacy & performance. While it is on, Fjord now and
+    then runs one everyday search or opens one well-known site in an invisible, muted page and adds it to your history. It only uses built-in
+    lists of ordinary searches and sites, never follows links or results, and keeps no cookies or sign-ins from those visits
+Search engine button: roll the mouse wheel over it to switch engines (the logo spins round to the next one); click it for a popup with every engine
+    and a box for your own (paste its search address, with %s where the search words go)
 Updates: ⋯ menu > Check for updates (also checks on launch; set GITHUB_REPO and APP_VERSION below)
+Site settings: the sliders button in the toolbar (or ⋯ menu > View & appearance > Site settings…) opens a popup for the site you're on:
+    JavaScript, images, ad blocking, zoom and saved camera/microphone answers, each remembered for that site only
 Toolbar: right-click it (or ⋯ menu > Customize toolbar…), then drag buttons to rearrange, remove or add them
 Interface style: ⋯ menu > View & appearance > Interface style (or right-click the toolbar, or Settings > Window); add a small indicator button via Customize toolbar:
     Default (Fjord as it is), macOS (Safari-like liquid glass + motion + macOS buttons) or Windows (Windows 11 look + Windows buttons)
@@ -70,6 +78,7 @@ import plistlib
 import re
 import secrets
 import queue
+import random
 import shutil
 import socket
 import sqlite3
@@ -87,7 +96,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, quote_plus, unquote, urlparse
 # ----- auto-update -----
 # Bump APP_VERSION on every release so it matches the GitHub release tag (tag "v1.2.0" or "1.2.0" -> "1.2.0").
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 GITHUB_REPO = "gargoyle-coder/fjord_browser"      # <- change to "owner/repo" of your GitHub repository
 UPDATE_ASSET = "fjord.py"  # name of the file attached to each release (falls back to the file at the release tag)
 
@@ -104,14 +113,16 @@ except ImportError:
 
 # Speed modes. "sleep" = (freeze after s, discard after s) or None to keep background tabs awake.
 # "flags" are Chromium switches, which only take effect at launch; the rest applies instantly.
+# NOTE: do not add --enable-low-end-device-mode here. It makes Chromium render pages with 4-bit colour (RGBA_4444),
+# which posterises photos and shifts colours. RAM is saved by the process limits and tab sleeping instead.
 SPEED_MODES = {
     "eco": {"label": "Eco", "desc": "Saves RAM and power", "needle": -55,
             "sleep": (15, 90), "cache_mb": 16, "trim_ticks": 4,
-            "flags": ["--enable-low-end-device-mode", "--renderer-process-limit=2", "--num-raster-threads=1",
+            "flags": ["--renderer-process-limit=2", "--num-raster-threads=1",
                       "--disable-features=SpareRendererForSitePerProcess,BackgroundVideoTrackOptimization"]},
     "normal": {"label": "Normal", "desc": "Balanced (default)", "needle": 0,
                "sleep": (30, 240), "cache_mb": 32, "trim_ticks": 8,
-               "flags": ["--enable-low-end-device-mode", "--renderer-process-limit=4", "--num-raster-threads=2",
+               "flags": ["--renderer-process-limit=4", "--num-raster-threads=2",
                          "--disable-features=SpareRendererForSitePerProcess,BackgroundVideoTrackOptimization"]},
     "turbo": {"label": "Turbo", "desc": "Uses all the resources it can", "needle": 55,
               "sleep": None, "cache_mb": 512, "trim_ticks": 0,
@@ -218,6 +229,11 @@ TERM = {"on": True, "normal": False}   # the "Terminal style" switches in Settin
 
 def term_on():
     return TERM["on"] if PRIVATE else TERM["normal"]
+
+
+def style_key():
+    """Which look is on right now: 'term' (Terminal style), 'mac', 'windows' or 'default'."""
+    return "term" if term_on() else UI["mode"]
 
 
 def term_prompt():
@@ -601,8 +617,16 @@ def animate(obj, prop, start, end, ms=220, curve=QEasingCurve.Type.OutCubic, don
     a.setDuration(ms)
     a.setStartValue(start)
     a.setEndValue(end)
-    if UI["mode"] == "mac" and isinstance(curve, QEasingCurve.Type) and curve == QEasingCurve.Type.OutCubic:
-        a.setEasingCurve(mac_curve())  # the macOS style eases everything the Apple way
+    if isinstance(curve, QEasingCurve.Type) and curve == QEasingCurve.Type.OutCubic:
+        if UI["mode"] == "mac":
+            a.setEasingCurve(mac_curve())  # the macOS style eases everything the Apple way
+        else:  # a longer, softer landing than plain OutCubic (Fluent-style in Windows)
+            c = QEasingCurve(QEasingCurve.Type.BezierSpline)
+            if UI["mode"] == "windows":
+                c.addCubicBezierSegment(QPointF(0.1, 0.9), QPointF(0.2, 1.0), QPointF(1.0, 1.0))
+            else:
+                c.addCubicBezierSegment(QPointF(0.22, 1.0), QPointF(0.36, 1.0), QPointF(1.0, 1.0))
+            a.setEasingCurve(c)
     else:
         a.setEasingCurve(curve)
     if done:
@@ -660,7 +684,7 @@ def to_url(text, engine="Google"):
         return QUrl("http://" + t)
     if " " not in t and "." in t:
         return QUrl("https://" + t)
-    return QUrl(ENGINES[engine] + "?q=" + quote_plus(t))
+    return QUrl(search_url(engine, t))
 
 
 def cli_to_url(arg, engine="Google"):
@@ -1414,6 +1438,23 @@ def settings_html(b):
                + ' requests blocked this session</small></div><a class=x href="fjord://adblock-update">Update now</a></div>'
                + paused_rows + "</div>")
 
+    if PRIVATE:
+        noise_sec = ("<h2>History randomiser</h2><div class=card><div class=row><div>Fill my history with everyday browsing"
+                     "<small>Not available in a private window: nothing is saved to history here</small></div></div></div>")
+    else:
+        noise_rows = sw("history_noise", "Fill my history with everyday browsing",
+                        "While Fjord is open, now and then runs one ordinary search or opens one well-known site in the background and "
+                        "adds it to your history. It only uses built-in lists of everyday searches and sites, never follows links or "
+                        "results, never touches your tabs, and keeps no cookies or sign-ins from those visits")
+        if st.get("history_noise"):
+            cur_rate = st.get("history_noise_rate") if st.get("history_noise_rate") in NOISE_RATES else "normal"
+            noise_rows += ('<div class=row><div>How often<small>%s</small></div>' % e(NOISE_RATES[cur_rate][2])
+                           + seg("history_noise_rate", [(k, k.capitalize()) for k in NOISE_RATES], cur_rate) + "</div>")
+            n_gen = b.noise_count()
+            noise_rows += ('<div class=row><div>Generated entries<small>%d in your history now (the newest %d are kept)</small></div>'
+                           '<a class=x href="%s">Remove them</a></div>' % (n_gen, NOISE_KEEP, L("history_noise_clear", 1)))
+        noise_sec = "<h2>History randomiser</h2><div class=card>" + noise_rows + "</div>"
+
     def opt(v, label):
         return "<option value=%s%s>%s</option>" % (v, " selected" if st.get("proxy_type", "socks5") == v else "", label)
     vpn = ("<h2>VPN / Proxy</h2><div class=card>"
@@ -1650,6 +1691,7 @@ def settings_html(b):
                     "Exit" if b.focus_mode else "Start"))
     scratch_sec = ("<h2>Scratchpad</h2><div class=card>"
                    + sw("scratch_popup", "Pop up when dragging", "Open the Scratchpad when you drag an image, file, text or a link toward the window", True)
+                   + sw("scratch_clipboard", "Capture what I copy", "Add text, links, images and files you copy to the Scratchpad automatically (copied passwords are skipped)", True)
                    + "</div>")
     tabs_sec = ("<h2>Tab previews</h2><div class=card>"
                 + sw("tab_preview", "Preview on hover", "Float a thumbnail card with the page's title and address next to a tab when the pointer rests on it", True)
@@ -1685,7 +1727,7 @@ def settings_html(b):
             ("tabs", "Tabs & sidebar", sidebar_sec + tabs_sec + ess_sec),
             ("performance", "Speed & memory", perf_sec),
             ("newtab", "New tab", greet_sec + bg_sec),
-            ("privacy", "Search & privacy", search_sec + privacy + vpn + private_sec),
+            ("privacy", "Search & privacy", search_sec + privacy + noise_sec + vpn + private_sec),
             ("features", "Features", focus_sec + palette_sec + notes_sec + scratch_sec),
             ("controls", "Keyboard & mouse", keys_sec + mouse_sec),
             ("extensions", "Extensions", ext_sec),
@@ -3690,6 +3732,26 @@ class PrivacyDashboard(GlassPopup):
         arow.addWidget(self.sw)
         lay.addLayout(arow)
 
+        sep3 = QFrame()
+        sep3.setObjectName("sep")
+        lay.addWidget(sep3)
+
+        nrow = QHBoxLayout()
+        ncol = QVBoxLayout()
+        ncol.setSpacing(0)
+        self.hn_title = QLabel("History randomiser")
+        self.hn_sub = QLabel("")
+        self.hn_sub.setObjectName("sub")
+        self.hn_sub.setWordWrap(True)
+        ncol.addWidget(self.hn_title)
+        ncol.addWidget(self.hn_sub)
+        nrow.addLayout(ncol, 1)
+        self.hn_sw = SwitchToggle()
+        self.hn_sw.animated = True
+        self.hn_sw.clicked.connect(self._noise_toggled)
+        nrow.addWidget(self.hn_sw)
+        lay.addLayout(nrow)
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.refresh)
         self._timer.start(1000)  # counts climb while the page is still loading
@@ -3819,10 +3881,24 @@ class PrivacyDashboard(GlassPopup):
             self.sw.setChecked(not paused)
             self.ab_sub.setText("Blocking ads and trackers" if not paused else "Paused: ads are allowed here")
 
+        if PRIVATE:
+            self.hn_sw.setChecked(False)
+            self.hn_sw.setEnabled(False)
+            self.hn_sub.setText("Not available in a private window")
+        else:
+            noise_on = bool(st.get("history_noise"))
+            self.hn_sw.setChecked(noise_on)
+            self.hn_sub.setText("Adding everyday searches and sites to your history" if noise_on
+                                else "Adds ordinary searches and sites to your history")
+
     def _site_toggled(self):
         site = self._tab_site()
         if site:
             self.win.pause_site(site, not self.sw.isChecked())  # switch off = allow ads on this site (reloads the page)
+        QTimer.singleShot(250, self.refresh)
+
+    def _noise_toggled(self):
+        self.win.set_history_noise(self.hn_sw.isChecked())
         QTimer.singleShot(250, self.refresh)
 
     def _vpn(self):
@@ -3832,6 +3908,164 @@ class PrivacyDashboard(GlassPopup):
 
     def _before_close(self):
         self._timer.stop()
+
+
+class SiteSettings(GlassPopup):
+    """Popup under the toolbar's site-settings button: everything Fjord remembers for the website you are on."""
+
+    GUARD = "_sitepop_closed"
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.setObjectName("privdash")  # shares the privacy popup's stylesheet
+        self.setFixedWidth(340)
+        self.setStyleSheet(themed(PrivacyDashboard._qss()))
+        self.host = ""
+        self.rows = {}
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+        t = QLabel("~/site" if term_on() else "Site settings")
+        t.setObjectName("hd")
+        self.site = QLabel("")
+        self.site.setObjectName("sub")
+        lay.addWidget(t)
+        lay.addWidget(self.site)
+
+        def separator():
+            sep = QFrame()
+            sep.setObjectName("sep")
+            lay.addWidget(sep)
+
+        def text_col(title):
+            col = QVBoxLayout()
+            col.setSpacing(0)
+            lab = QLabel(title)
+            sub = QLabel("")
+            sub.setObjectName("sub")
+            sub.setWordWrap(True)
+            col.addWidget(lab)
+            col.addWidget(sub)
+            return col, sub
+
+        def switch_row(key, title):
+            separator()
+            row = QHBoxLayout()
+            col, sub = text_col(title)
+            row.addLayout(col, 1)
+            sw = SwitchToggle()
+            sw.animated = True
+            sw.clicked.connect(lambda _c=False, k=key: self._flip(k))
+            row.addWidget(sw)
+            lay.addLayout(row)
+            self.rows[key] = (sw, sub)
+
+        def button(text, slot, width=None):
+            b = QPushButton(text)
+            b.setObjectName("pbtn")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False: slot())
+            if width:
+                b.setFixedWidth(width)
+            return b
+
+        switch_row("js", "JavaScript")
+        switch_row("images", "Images")
+        switch_row("ads", "Ad blocking")
+
+        separator()
+        zrow = QHBoxLayout()
+        zcol, self.zoom_sub = text_col("Zoom")
+        zrow.addLayout(zcol, 1)
+        zrow.addWidget(button("\u2212", lambda: self._zoom(-0.1), 34))
+        self.zoom_btn = button("100%", lambda: self._zoom(0), 62)
+        zrow.addWidget(self.zoom_btn)
+        zrow.addWidget(button("+", lambda: self._zoom(0.1), 34))
+        lay.addLayout(zrow)
+
+        separator()
+        prow = QHBoxLayout()
+        pcol, self.perm_sub = text_col("Camera & microphone")
+        prow.addLayout(pcol, 1)
+        self.perm_btn = button("Reset", self._perm_reset)
+        prow.addWidget(self.perm_btn)
+        lay.addLayout(prow)
+
+        lay.addSpacing(2)
+        self.reset_btn = button("Reset this site", self._reset)
+        lay.addWidget(self.reset_btn)
+        self.refresh()
+
+    def _tab_url(self):
+        t = self.win.cur()
+        return t.url() if t is not None else QUrl()
+
+    def refresh(self):
+        w = self.win
+        host = self.host = w.site_host(self._tab_url())
+        cfg = w.site_cfg(host)
+        self.site.setText(host or "This page isn't a website")
+
+        def put(key, on, sub, enabled=True):
+            sw, lab = self.rows[key]
+            sw.setChecked(bool(on))
+            sw.setEnabled(bool(enabled))
+            lab.setText(sub)
+
+        has = bool(host)
+        none = "Open a website to change this"
+        js = cfg.get("js", True)
+        put("js", js, ("Scripts run normally" if js else "Scripts are blocked on this site") if has else none, has)
+        im = cfg.get("images", True)
+        put("images", im, ("Pictures load normally" if im else "Pictures are not loaded on this site") if has else none, has)
+        ab = w.adblock
+        if not has:
+            put("ads", False, none, False)
+        elif not ab.enabled:
+            put("ads", False, "Ad blocking is off everywhere (Menu > Privacy & performance)", False)
+        else:
+            paused = ab.is_paused(host)
+            put("ads", not paused, "Paused: ads are allowed here" if paused else "Blocking ads and trackers", True)
+
+        t = w.cur()
+        z = t.zoomFactor() if (t is not None and has) else 1.0
+        self.zoom_btn.setText("%d%%" % round(z * 100))
+        self.zoom_btn.setEnabled(has)
+        self.zoom_sub.setText(("Remembered for this site" if "zoom" in cfg else "Not changed here") if has else none)
+        ents = w.site_perm_entries(host) if has else []
+        word = {"allow": "allowed", "deny": "blocked"}
+        self.perm_sub.setText(" \u00b7 ".join("%s %s" % (PERM_WHAT.get(p, p).capitalize(), word.get(v, v)) for _k, p, v in ents)
+                              if ents else ("Asks each time" if has else none))
+        self.perm_btn.setEnabled(bool(ents))
+        self.reset_btn.setEnabled(has and (bool(cfg) or bool(ents) or ab.is_paused(host)))
+
+    def _flip(self, key):
+        w, host = self.win, self.host
+        on = self.rows[key][0].isChecked()
+        if False:
+            pass
+        elif host:
+            if key == "ads":
+                w.pause_site(host, not on)
+            else:
+                w.set_site_flag(host, key, on)
+        QTimer.singleShot(250, self.refresh)
+
+    def _zoom(self, d):
+        if self.host:
+            self.win.zoom(d) if d else self.win.zoom_reset()
+        self.refresh()
+
+    def _perm_reset(self):
+        if self.host:
+            self.win.site_perm_reset(self.host)
+            self.win.toast("Camera and microphone answers forgotten for %s" % self.host, 3000)
+        self.refresh()
+
+    def _reset(self):
+        host = self.host
+        self.close()
+        QTimer.singleShot(0, lambda: self.win.site_reset(host))
 
 
 class SpeedRow(QAbstractButton):
@@ -4020,6 +4254,267 @@ class SpeedPopup(GlassPopup):
             except RuntimeError:
                 pass
         QTimer.singleShot(260, done)
+
+
+class EngineRow(SpeedRow):
+    """One search engine in the engine popup: its logo, name and address, a tick on the current one, and a small cross on your own."""
+    removed = pyqtSignal(str)
+    XW = 24
+
+    def __init__(self, name, selected, custom=False):
+        host = ENGINE_DOMAIN.get(name) or (urlparse(ENGINES.get(name, "")).hostname or "")
+        super().__init__(name, {"label": name, "desc": ("> " if term_on() else "") + host}, selected)
+        self.custom, self._xh, self._xdown = custom, 0.0, False
+        self._logo = engine_icon(name).pixmap(64, 64)
+        if custom:
+            self.setMouseTracking(True)
+            self.setToolTip("Your own engine. Click the cross to remove it.")
+
+    def _x_rect(self):
+        return QRectF(self.width() - 58, (self.height() - self.XW) / 2.0, self.XW, self.XW)
+
+    def mouseMoveEvent(self, e):
+        if self.custom:
+            on = self._x_rect().contains(QPointF(e.position()))
+            if on != (self._xh > 0.5):
+                self._tween("_xh", 1.0 if on else 0.0, 120)
+        super().mouseMoveEvent(e)
+
+    def leaveEvent(self, e):
+        if self.custom:
+            self._tween("_xh", 0.0, 120)
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e):
+        if self.custom and e.button() == Qt.MouseButton.LeftButton and self._x_rect().contains(QPointF(e.position())):
+            self._xdown = True
+            e.accept()
+            return
+        self._xdown = False
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._xdown:
+            self._xdown = False
+            if self._x_rect().contains(QPointF(e.position())):
+                self.removed.emit(self.key)
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        mode = UI["mode"]
+        W, H = self.width(), self.height()
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        rad = {"mac": rr(14), "windows": rr(6)}.get(mode, rr(10))
+        term = term_on()
+        tint = QColor(TERM_BRIGHT if term else ACCENT["main"])
+        if term:
+            rad = 2.0
+            bg = self._mix(QColor(43, 255, 106, 10), QColor(43, 255, 106, 30), self._h)
+            bd = QColor(43, 255, 106, 72)
+        elif mode == "mac":
+            bg = self._mix(QColor(255, 255, 255, 15), QColor(255, 255, 255, 32), self._h)
+            bd = QColor(255, 255, 255, 23)
+        else:
+            bg = self._mix(QColor(themed("#1c2b3a")), QColor(themed("#243546")), self._h)
+            bd = QColor(themed("#2b3f54"))
+        p.setPen(QPen(bd, 1))
+        p.setBrush(bg)
+        p.drawRoundedRect(r, rad, rad)
+        if self._s > 0.01:  # the current engine: a tinted fill and rim that fade in
+            fill, rim = QColor(tint), QColor(tint)
+            fill.setAlpha(int(46 * self._s))
+            rim.setAlpha(int(170 * self._s))
+            p.setPen(QPen(rim, 1.2))
+            p.setBrush(fill)
+            p.drawRoundedRect(r, rad, rad)
+        if not self._logo.isNull():  # the logo swells a touch under the pointer
+            g = 28.0 * (1.0 + 0.07 * self._h)
+            p.drawPixmap(QRectF(28 - g / 2.0, H / 2.0 - g / 2.0, g, g), self._logo, QRectF(self._logo.rect()))
+        right = 96 if self.custom else 44
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        f.setWeight(QFont.Weight.DemiBold)
+        p.setFont(f)
+        p.setPen(self._mix(QColor(TERM_TEXT), tint, self._s) if term else QColor("#e4edf3"))
+        p.drawText(QRectF(56, 8, W - 56 - right, 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   QFontMetrics(f).elidedText(self.label, Qt.TextElideMode.ElideRight, int(W - 56 - right)))
+        f.setPixelSize(11)
+        f.setWeight(QFont.Weight.Normal)
+        p.setFont(f)
+        p.setPen(QColor(TERM_DIM) if term else QColor(themed("#8ea3b4")))
+        p.drawText(QRectF(56, 27, W - 56 - right, 16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   QFontMetrics(f).elidedText(self.desc, Qt.TextElideMode.ElideRight, int(W - 56 - right)))
+        if self.custom:  # a little cross to remove your own engine
+            xr = self._x_rect()
+            col = self._mix(QColor(TERM_DIM if term else "#8ea3b4"), QColor(TERM_WARN if term else "#ff7a90"), self._xh)
+            if self._xh > 0.01:
+                halo = QColor(col)
+                halo.setAlpha(int(46 * self._xh))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(halo)
+                p.drawEllipse(xr)
+            p.setPen(QPen(col, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            c, d = xr.center(), 4.0
+            p.drawLine(QPointF(c.x() - d, c.y() - d), QPointF(c.x() + d, c.y() + d))
+            p.drawLine(QPointF(c.x() - d, c.y() + d), QPointF(c.x() + d, c.y() - d))
+        if term and self._s > 0.01:  # terminal: a [x] checkbox instead of a tick
+            c = QColor(tint)
+            c.setAlpha(int(255 * self._s))
+            f.setPixelSize(13)
+            f.setWeight(QFont.Weight.Bold)
+            p.setFont(f)
+            p.setPen(c)
+            p.drawText(QRectF(W - 46, 0, 36, H), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "[x]")
+        elif self._s > 0.01:  # tick
+            c = QColor(tint)
+            c.setAlpha(int(255 * self._s))
+            p.setPen(QPen(c, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            cx, cy = W - 26, H / 2.0
+            tick = QPainterPath()
+            tick.moveTo(cx - 5, cy)
+            tick.lineTo(cx - 1.5, cy + 4)
+            tick.lineTo(cx + 5, cy - 4)
+            p.drawPath(tick)
+        p.end()
+
+
+class EnginePopup(GlassPopup):
+    """Popup under the toolbar's search-engine button: pick an engine, or type the address of your own. It is the same panel as the
+    privacy and speed popups, so it follows the macOS (glass), Windows and terminal looks."""
+    GUARD = "_enginepop_closed"
+    HINT = "Paste its search address and put %s where the search words go."
+
+    @staticmethod
+    def _qss():
+        mode, acc = UI["mode"], ACCENT["main"]
+        if term_on():
+            edit = ("QLineEdit#engurl{background:#030704;color:#8dffb0;border:1px solid #12b84a;border-radius:2px;padding:6px 8px;"
+                    "selection-background-color:#12b84a;selection-color:#030704;}"
+                    "QLineEdit#engurl:focus{border:1px solid #2bff6a;}")
+        elif mode == "mac":
+            edit = ("QLineEdit#engurl{background:rgba(255,255,255,0.07);color:#e4edf3;border:1px solid rgba(255,255,255,0.12);"
+                    "border-radius:14px;padding:6px 12px;selection-background-color:%s;selection-color:#0b141d;}"
+                    "QLineEdit#engurl:focus{background:rgba(255,255,255,0.10);border:1px solid %s;}" % (acc, acc))
+        elif mode == "windows":
+            edit = ("QLineEdit#engurl{background:rgba(255,255,255,0.06);color:#e4edf3;border:1px solid rgba(255,255,255,0.08);"
+                    "border-bottom:1px solid rgba(255,255,255,0.35);border-radius:5px;padding:6px 10px;"
+                    "selection-background-color:%s;selection-color:#0b141d;}"
+                    "QLineEdit#engurl:focus{background:#1c2b3a;border:1px solid rgba(255,255,255,0.08);border-bottom:2px solid %s;}" % (acc, acc))
+        else:
+            edit = ("QLineEdit#engurl{background:#1c2b3a;color:#e4edf3;border:1px solid #2b3f54;border-radius:10px;padding:6px 12px;"
+                    "selection-background-color:%s;selection-color:#0b141d;}"
+                    "QLineEdit#engurl:focus{border:1px solid %s;}" % (acc, acc))
+        return PrivacyDashboard._qss() + edit
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.setObjectName("privdash")  # shares the privacy popup's stylesheet
+        self.setFixedWidth(330)
+        self.setStyleSheet(themed(self._qss()))
+        self._picked = False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(8)
+        t = QLabel("~/search" if term_on() else "Search engine")
+        t.setObjectName("hd")
+        s = QLabel("Used by the address bar and the new tab page")
+        s.setObjectName("sub")
+        lay.addWidget(t)
+        lay.addWidget(s)
+        lay.addSpacing(2)
+        self.rows = []
+        self.rows_lay = QVBoxLayout()
+        self.rows_lay.setSpacing(8)
+        lay.addLayout(self.rows_lay)
+        mine = CUSTOM_ENGINE.get("name")
+        for name in ENGINES:
+            row = EngineRow(name, name == win.engine, custom=(name == mine))
+            row.clicked.connect(lambda _c=False, n=name: self._pick(n))
+            row.removed.connect(self._remove)
+            self.rows_lay.addWidget(row)
+            self.rows.append(row)
+        sep = QFrame()
+        sep.setObjectName("sep")
+        lay.addWidget(sep)
+        cap = QLabel("# your own engine" if term_on() else "Your own search engine")
+        cap.setStyleSheet("font-weight:600;")
+        lay.addWidget(cap)
+        erow = QHBoxLayout()
+        erow.setSpacing(8)
+        self.edit = QLineEdit()
+        self.edit.setObjectName("engurl")
+        self.edit.setPlaceholderText(("$ " if term_on() else "") + "https://example.com/search?q=%s")
+        self.edit.setFixedHeight(34)
+        self.edit.returnPressed.connect(self._add)
+        self.edit.textChanged.connect(self._reset_note)
+        self.add_btn = QPushButton("Replace" if mine else "Add")
+        self.add_btn.setObjectName("pbtn")
+        self.add_btn.setFixedHeight(34)
+        self.add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_btn.clicked.connect(self._add)
+        erow.addWidget(self.edit, 1)
+        erow.addWidget(self.add_btn)
+        lay.addLayout(erow)
+        self.note = QLabel(self.HINT)
+        self.note.setObjectName("sub")
+        self.note.setWordWrap(True)
+        self.note.setMinimumHeight(30)
+        lay.addWidget(self.note)
+
+    def _warn(self, msg):
+        self.note.setText(msg)
+        self.note.setStyleSheet("color:%s;" % (TERM_WARN if term_on() else "#ff8a8a"))
+
+    def _reset_note(self):
+        if self.note.text() != self.HINT:
+            self.note.setText(self.HINT)
+            self.note.setStyleSheet("")
+
+    def _after_intro(self):
+        for i, row in enumerate(self.rows):  # the rows rise in one after another
+            eff = QGraphicsOpacityEffect(row)
+            eff.setOpacity(0.0)
+            row.setGraphicsEffect(eff)
+            QTimer.singleShot(50 + 45 * i, lambda ef=eff: SpeedPopup._fade_row(ef))
+
+    def _pick(self, name):
+        if self._picked:
+            return
+        self._picked = True
+        for r in self.rows:
+            r.set_selected(r.key == name)  # the tick glides over to the new choice, then the popup folds away
+
+        def done():
+            try:
+                self.close()
+                if name != self.win.engine:
+                    self.win.set_engine(name)
+            except RuntimeError:
+                pass
+        QTimer.singleShot(260, done)
+
+    def _add(self):
+        if self._picked:
+            return
+        ok, msg = self.win.set_custom_engine(self.edit.text())
+        if not ok:
+            self._warn(msg)
+            return
+        self._picked = True
+        self.close()
+
+    def _remove(self, name):
+        if self._picked:
+            return
+        self._picked = True
+        self.close()
+        self.win.remove_custom_engine()
 
 
 class QuietServer(ThreadingHTTPServer):
@@ -4987,8 +5482,147 @@ ENGINE_BADGE = {"Google": ("#4285F4", "G"), "DuckDuckGo": ("#DE5833", "D"), "Bin
                 "Brave": ("#FB542B", "B")}
 ENGINE_DOMAIN = {"Google": "google.com", "DuckDuckGo": "duckduckgo.com", "Bing": "bing.com",
                  "Brave": "search.brave.com"}
+# DuckDuckGo's downloaded favicon is a logo on a white tile, so for these only the clean vector logo (a round disc) is ever used.
+ENGINE_VECTOR_ONLY = ("DuckDuckGo",)
+BUILTIN_ENGINES = tuple(ENGINES)
+CUSTOM_ENGINE = {"name": None}   # the one search engine you added yourself (it lives in ENGINES while it exists)
+
+
+def search_url(engine, text):
+    """Address for a web search. Built-in engines take ?q=words; one you added holds %s where the words go."""
+    base = ENGINES.get(engine) or ENGINES["Google"]
+    q = quote_plus(text)
+    if "%s" in base:
+        return base.replace("%s", q)
+    return base + "?q=" + q
+
+
+def engine_param(name):
+    """The query parameter an engine uses for the search words (q for the built-in ones)."""
+    m = re.search(r"[?&]([^=&]+)=%s", ENGINES.get(name, ""))
+    return m.group(1) if m else "q"
+
+
+def clean_engine_template(raw):
+    """What was typed in the popup's own-engine box -> (name, address with %s), or (None, why it can't be used)."""
+    t = (raw or "").strip()
+    if not t:
+        return None, "Type or paste a search address first."
+    if re.search(r"\s", t):
+        return None, "A search address can't contain spaces."
+    for ph in ("{searchTerms}", "{query}", "{q}"):
+        t = t.replace(ph, "%s")
+    if "://" not in t:
+        local = re.match(r"(localhost|\d{1,3}(\.\d{1,3}){3})(:|/|\?|$)", t, re.I)
+        t = ("http://" if local else "https://") + t
+    try:
+        u = urlparse(t)
+        host = (u.hostname or "").lower()
+        u.port  # raises ValueError if the port isn't a number
+    except ValueError:
+        return None, "That doesn't look like a web address."
+    if u.scheme not in ("http", "https") or not re.fullmatch(r"[\w.\-]+", host) or len(t) > 400:
+        return None, "That doesn't look like a web address."
+    if "%s" not in t:   # be forgiving: guess where the search words belong
+        if t.endswith("="):
+            t += "%s"
+        elif t.endswith(("?", "&")):
+            t += "q=%s"
+        else:
+            t += ("&" if "?" in t else "?") + "q=%s"
+    if host.startswith("www."):
+        host = host[4:]
+    parts = host.split(".")
+    if len(parts) < 2 or host.replace(".", "").isdigit():
+        core = host
+    else:
+        core = parts[-2]
+        if len(parts) >= 3 and core in ("co", "com", "org", "net", "gov", "ac", "edu"):
+            core = parts[-3]
+    name = (core[:1].upper() + core[1:])[:24] or "Custom"
+    if name in BUILTIN_ENGINES:
+        name += " (custom)"
+    return name, t
+
+
+def unregister_custom_engine():
+    old = CUSTOM_ENGINE.get("name")
+    if old:
+        ENGINES.pop(old, None)
+        ENGINE_DOMAIN.pop(old, None)
+    CUSTOM_ENGINE["name"] = None
+
+
+def register_custom_engine(name, template):
+    unregister_custom_engine()
+    ENGINES[name] = template
+    host = urlparse(template).hostname
+    if host:
+        ENGINE_DOMAIN[name] = host
+    CUSTOM_ENGINE["name"] = name
+
+
+def load_custom_engine(settings):
+    """Bring back the search engine you added in an earlier session."""
+    ce = settings.get("custom_engine")
+    if not isinstance(ce, dict):
+        return
+    name, tpl = clean_engine_template(ce.get("url"))
+    if name is None:
+        return
+    saved = ce.get("name")
+    if isinstance(saved, str) and re.fullmatch(r"[\w .()\-]{1,40}", saved) and saved not in BUILTIN_ENGINES:
+        name = saved
+    register_custom_engine(name, tpl)
+
+
 GROUP_COLORS = [("Blue", "#4fb0e8"), ("Teal", "#7ef0d0"), ("Pink", "#ff7a90"), ("Yellow", "#ffd166"),
                 ("Green", "#7ee081"), ("Orange", "#ff9f6b")]
+# Each interface style has its own group colours: Apple system colours, Windows 11 accents, and terminal inks.
+GROUP_PALETTES = {
+    "default": GROUP_COLORS,
+    "mac": [("Blue", "#0a84ff"), ("Mint", "#63e6e2"), ("Pink", "#ff375f"), ("Yellow", "#ffd60a"),
+            ("Green", "#30d158"), ("Orange", "#ff9f0a"), ("Purple", "#bf5af2")],
+    "windows": [("Blue", "#60cdff"), ("Teal", "#6ccbc3"), ("Purple", "#b4a0ff"), ("Yellow", "#fce100"),
+                ("Green", "#6ccb5f"), ("Orange", "#ff8c00"), ("Red", "#ff6a6a")],
+    "term": [("Green", "#2bff6a"), ("Amber", "#ffb62b"), ("Cyan", "#2be8ff"), ("Magenta", "#ff4fd8"),
+             ("White", "#e6e6e6"), ("Red", "#ff5f56")],
+}
+
+
+def group_palette():
+    return GROUP_PALETTES.get(style_key(), GROUP_COLORS)
+
+
+def swatch_icon(color):
+    pm = QPixmap(28, 28)
+    pm.fill(Qt.GlobalColor.transparent)
+    pp = QPainter(pm)
+    pp.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pp.setPen(Qt.PenStyle.NoPen)
+    pp.setBrush(QColor(color))
+    pp.drawEllipse(QRectF(4, 4, 20, 20))
+    pp.end()
+    pm.setDevicePixelRatio(2.0)
+    return QIcon(pm)
+
+
+def group_curve():
+    """How an island slides open or shut: Apple's sheet curve, Fluent's decelerate, a soft landing, or a snappy terminal ease."""
+    key = style_key()
+    if key == "mac":
+        return mac_curve()
+    if key == "term":
+        return QEasingCurve(QEasingCurve.Type.OutQuad)
+    c = QEasingCurve(QEasingCurve.Type.BezierSpline)
+    if key == "windows":
+        c.addCubicBezierSegment(QPointF(0.1, 0.9), QPointF(0.2, 1.0), QPointF(1.0, 1.0))
+    else:
+        c.addCubicBezierSegment(QPointF(0.22, 1.0), QPointF(0.36, 1.0), QPointF(1.0, 1.0))
+    return c
+
+
+GROUP_MS = {"mac": 380, "windows": 260, "term": 150, "default": 320}
 
 
 def badge_icon(letter, color):
@@ -5055,7 +5689,7 @@ def engine_svg_pixmap(name, size=64):
 def engine_png_bytes(name):
     """PNG bytes of the best available logo: downloaded hi-res > embedded vector > None."""
     path = ICON_DIR / ("engine-hq-%s.png" % name)
-    if path.exists():
+    if name not in ENGINE_VECTOR_ONLY and path.exists():
         try:
             return path.read_bytes()
         except OSError:
@@ -5073,7 +5707,7 @@ def engine_png_bytes(name):
 
 def engine_icon(name):
     path = ICON_DIR / ("engine-hq-%s.png" % name)
-    if path.exists():
+    if name not in ENGINE_VECTOR_ONLY and path.exists():
         pm = QPixmap(str(path))
         if not pm.isNull():
             return QIcon(pm)
@@ -5095,9 +5729,9 @@ class IconFetcher(QObject):
         got = False
         try:
             ICON_DIR.mkdir(parents=True, exist_ok=True)
-            for name, dom in ENGINE_DOMAIN.items():
+            for name, dom in list(ENGINE_DOMAIN.items()):
                 path = ICON_DIR / ("engine-hq-%s.png" % name)
-                if path.exists():
+                if name in ENGINE_VECTOR_ONLY or path.exists():
                     continue
                 try:
                     req = urllib.request.Request("https://www.google.com/s2/favicons?domain=%s&sz=128" % dom,
@@ -7255,9 +7889,16 @@ class MouseBinder(QObject):
 
 # Site permissions Fjord asks about. Keys are the Qt enum names (same in the old Feature and the new PermissionType enums);
 # to prompt for another kind of permission, add it to these three tables.
-PERM_KINDS = {"MediaAudioCapture": "mic", "MediaVideoCapture": "camera", "MediaAudioVideoCapture": "camera+mic"}
-PERM_WHAT = {"mic": "microphone", "camera": "camera", "camera+mic": "camera and microphone"}
-PERM_PARTS = {"mic": ("mic",), "camera": ("camera",), "camera+mic": ("camera", "mic")}
+PERM_KINDS = {"MediaAudioCapture": "mic", "MediaVideoCapture": "camera", "MediaAudioVideoCapture": "camera+mic",
+              "Geolocation": "geo", "Notifications": "notif", "ClipboardReadWrite": "clip",
+              "MouseLock": "lock", "LocalFontsAccess": "fonts"}
+PERM_WHAT = {"mic": "microphone", "camera": "camera", "camera+mic": "camera and microphone",
+             "geo": "location", "notif": "notifications", "clip": "clipboard", "lock": "pointer lock", "fonts": "local fonts"}
+PERM_PARTS = {"mic": ("mic",), "camera": ("camera",), "camera+mic": ("camera", "mic"), "geo": ("geo",),
+              "notif": ("notif",), "clip": ("clip",), "lock": ("lock",), "fonts": ("fonts",)}
+PERM_ASK = {"mic": "use your microphone", "camera": "use your camera", "camera+mic": "use your camera and microphone",
+            "geo": "know your location", "notif": "show notifications", "clip": "read what you copy",
+            "lock": "lock your pointer", "fonts": "see the fonts installed on this device"}
 
 
 class Page(QWebEnginePage):
@@ -7304,6 +7945,8 @@ class Page(QWebEnginePage):
             return False
         if is_main and url.scheme() in ("http", "https"):
             self.tab.browser.adblock.update_site(self, url.host())  # site-specific hiding for the page about to load
+        if is_main:
+            self.tab.browser.apply_site_settings(self, url)  # this site's JavaScript / image settings, before the page loads
         return super().acceptNavigationRequest(url, nav_type, is_main)
 
     def _internal_origin(self, nav_type):
@@ -7547,12 +8190,30 @@ class NewGroupButton(FadeButton):
             draw_glyph(p, "group", QRectF((self.width() - 18) / 2, (self.height() - 18) / 2, 18, 18), col, ToolIcon.STROKE)
             p.end()
             return
-        pen = QPen(QColor(255, 255, 255, 64 if self._h > 0.5 else 46), 1.2)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setDashPattern([3.0, 3.0])
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.8, 0.8, -0.8, -0.8), rr(self.radius), rr(self.radius))
+        key, h = style_key(), self._h
+        r = QRectF(self.rect()).adjusted(0.8, 0.8, -0.8, -0.8)
+        if key == "mac":  # a solid glass capsule
+            g = QLinearGradient(r.topLeft(), r.bottomLeft())
+            g.setColorAt(0.0, QColor(255, 255, 255, int(26 + 22 * h)))
+            g.setColorAt(1.0, QColor(255, 255, 255, int(8 + 12 * h)))
+            p.setPen(QPen(QColor(255, 255, 255, int(52 + 44 * h)), 1.0))
+            p.setBrush(QBrush(g))
+            p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+        elif key == "windows":  # flat Fluent button: faint fill, hairline border, small corners
+            p.setPen(QPen(QColor(255, 255, 255, int(28 + 26 * h)), 1.0))
+            p.setBrush(QColor(255, 255, 255, int(10 + 16 * h)))
+            p.drawRoundedRect(r, 4, 4)
+        elif key == "term":  # a boxed [ + group ] in terminal ink
+            p.setPen(QPen(QColor(TERM_EDGE), 1.0))
+            p.setBrush(QColor(QColor(TERM_BRIGHT).red(), QColor(TERM_BRIGHT).green(), QColor(TERM_BRIGHT).blue(), int(36 * h)))
+            p.drawRoundedRect(r, 2, 2)
+        else:  # default: the dashed outline
+            pen = QPen(QColor(255, 255, 255, 64 if self._h > 0.5 else 46), 1.2)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setDashPattern([3.0, 3.0])
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(r, rr(self.radius), rr(self.radius))
         p.end()
 
 
@@ -7620,6 +8281,43 @@ class GroupChip(DropTarget, QWidget):
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._hp = self._pp = 0.0   # hover and press progress, eased so the pill never snaps
+        self._intro = 1.0           # a freshly made group pops in (0 -> 1)
+        self._hov_anim, self._press_anim = QVariantAnimation(self), QVariantAnimation(self)
+        self._hov_anim.valueChanged.connect(self._set_hp)
+        self._press_anim.valueChanged.connect(self._set_pp)
+
+    def _set_hp(self, v):
+        self._hp = float(v)
+        self.update()
+
+    def _set_pp(self, v):
+        self._pp = float(v)
+        self.update()
+
+    def _tween(self, anim, start, end, ms):
+        anim.stop()
+        anim.setDuration(ms)
+        anim.setStartValue(float(start))
+        anim.setEndValue(float(end))
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.start()
+
+    def intro(self):
+        """Pop in: grow from a slightly smaller size while fading in (a soft spring in the macOS style)."""
+        self._intro = 0.0
+        a = QVariantAnimation(self)
+        a.setDuration(420)
+        a.setStartValue(0.0)
+        a.setEndValue(1.0)
+        a.setEasingCurve(mac_curve(True, 1.15) if style_key() == "mac" else group_curve())
+
+        def step(v):
+            self._intro = float(v)
+            self.update()
+        a.valueChanged.connect(step)
+        a.start()
+        self._intro_anim = a
 
     def configure(self, name, color, count, compact, horiz):
         self.name, self.color, self.count = name, color, count
@@ -7639,35 +8337,40 @@ class GroupChip(DropTarget, QWidget):
 
     def enterEvent(self, e):
         self.hover = True
-        self.update()
+        self._tween(self._hov_anim, self._hp, 1.0, 150)
         super().enterEvent(e)
 
     def leaveEvent(self, e):
         self.hover = False
-        self.update()
+        if not self.drop:
+            self._tween(self._hov_anim, self._hp, 0.0, 260)
+        self._tween(self._press_anim, self._pp, 0.0, 200)
         super().leaveEvent(e)
 
     def mousePressEvent(self, e):
         self._press = e.button() == Qt.MouseButton.LeftButton
+        if self._press:
+            self._tween(self._press_anim, self._pp, 1.0, 90)
         super().mousePressEvent(e)
 
     def mouseReleaseEvent(self, e):
         if self._press and e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
             self.clicked.emit()
         self._press = False
+        self._tween(self._press_anim, self._pp, 0.0, 240)
         super().mouseReleaseEvent(e)
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasFormat(TAB_MIME):
             self.drop = True
-            self.update()
+            self._tween(self._hov_anim, self._hp, 1.0, 150)
             e.acceptProposedAction()
         else:
             super().dragEnterEvent(e)
 
     def dragLeaveEvent(self, e):
         self.drop = False
-        self.update()
+        self._tween(self._hov_anim, self._hp, 1.0 if self.hover else 0.0, 220)
         super().dragLeaveEvent(e)
 
     def dropEvent(self, e):
@@ -7675,59 +8378,117 @@ class GroupChip(DropTarget, QWidget):
             super().dropEvent(e)
             return
         self.drop = False
-        self.update()
+        self._tween(self._hov_anim, self._hp, 1.0 if self.hover else 0.0, 220)
         self.on_drop(int(bytes(e.mimeData().data(TAB_MIME)).decode()), self.gid)
         e.acceptProposedAction()
 
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        col, dark = QColor(self.color), QColor(11, 20, 29)
+        key = style_key()
+        col = QColor(self.color)
         f = QFont(self.font())
         f.setPixelSize(11)
-        f.setBold(True)
+        f.setBold(key != "term")
+        if key == "term":  # monospace, like everything else in the terminal look
+            try:
+                f.setFamilies(TERM_FONTS)
+            except Exception:
+                pass
         fm = QFontMetrics(f)
-        ph, chev, pad = 20.0, 12.0, 8.0
+        ph = 22.0 if key in ("mac", "windows") else 20.0
+        chev = 22.0 if key == "term" else 12.0          # the terminal draws "[v]" instead of a chevron
+        pad = 8.0
+        lead = {"windows": 15.0, "term": 6.0}.get(key, pad)   # room before the chevron (the Windows accent bar lives there)
         collapsed = self.open_p < 0.5
         if self.compact:
             label, pw, x0 = "", 30.0, (self.width() - 30.0) / 2
         else:
-            room = self.width() - 6 - pad * 2 - chev - 4 - (30 if collapsed else 8)
+            room = self.width() - 6 - lead - pad - chev - 4 - (30 if collapsed else 8)
             label = fm.elidedText(self.name, Qt.TextElideMode.ElideRight, max(20, int(room)))
-            pw, x0 = pad * 2 + chev + 4 + fm.horizontalAdvance(label), 6.0
+            pw, x0 = lead + pad + chev + 4 + fm.horizontalAdvance(label), 6.0
         y0 = (self.height() - ph) / 2
-        alpha = 255 if (self.hover or self.drop) else 215
+        rect = QRectF(x0, y0, pw, ph)
+        hp = max(self._hp, 1.0 if self.drop else 0.0)
+        ring = self.drop or (self.active and collapsed)
+        # pop-in and press feedback: scale around the pill's centre
+        sc = (0.86 + 0.14 * self._intro) * (1.0 - 0.04 * self._pp)
+        p.setOpacity(max(0.0, min(1.0, self._intro * 1.5)))
+        p.translate(rect.center())
+        p.scale(sc, sc)
+        p.translate(-rect.center())
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(col.red(), col.green(), col.blue(), alpha))
-        p.drawRoundedRect(QRectF(x0, y0, pw, ph), ph / 2, ph / 2)
-        if self.drop or (self.active and collapsed):
+        if key == "mac":  # a tinted glass capsule with a soft highlight along the top
+            g = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+            g.setColorAt(0.0, QColor(col.red(), col.green(), col.blue(), int(125 + 60 * hp)))
+            g.setColorAt(1.0, QColor(col.red(), col.green(), col.blue(), int(70 + 50 * hp)))
+            p.setBrush(QBrush(g))
+            p.setPen(QPen(QColor(255, 255, 255, int(70 + 60 * hp)), 1.0))
+            p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), ph / 2, ph / 2)
+            hl = QLinearGradient(rect.topLeft(), QPointF(rect.left(), rect.top() + ph * 0.55))
+            hl.setColorAt(0.0, QColor(255, 255, 255, 80))
+            hl.setColorAt(1.0, QColor(255, 255, 255, 0))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(hl))
+            p.drawRoundedRect(rect.adjusted(1.5, 1.5, -1.5, -ph * 0.45), ph / 2 - 1.5, ph / 2 - 1.5)
+            ink = QColor(255, 255, 255, 245)
+            if ring:
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor(255, 255, 255, 225), 1.6))
+                p.drawRoundedRect(rect.adjusted(0.8, 0.8, -0.8, -0.8), ph / 2, ph / 2)
+        elif key == "windows":  # a flat Fluent tag: tinted fill, hairline border, coloured bar on the left
+            p.setBrush(QColor(col.red(), col.green(), col.blue(), int(46 + 44 * hp)))
+            p.drawRoundedRect(rect, 5, 5)
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QPen(QColor(255, 255, 255, 230), 1.6))
-            p.drawRoundedRect(QRectF(x0 + 0.8, y0 + 0.8, pw - 1.6, ph - 1.6), ph / 2, ph / 2)
-        # chevron: points down when open, turns to point right when the island is slid shut
-        p.save()
-        p.translate(x0 + pad + chev / 2 - 1, y0 + ph / 2)
-        p.rotate(-90.0 * (1.0 - self.open_p))
-        pen = QPen(dark, 1.8)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPolyline(QPolygonF([QPointF(-3.2, -1.6), QPointF(0.0, 1.6), QPointF(3.2, -1.6)]))
-        p.restore()
+            p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 235) if ring else QColor(255, 255, 255, int(18 + 16 * hp)), 1.0))
+            p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 5, 5)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(x0 + 5, y0 + 5, 3, ph - 10), 1.5, 1.5)
+            ink = QColor(242, 242, 242)
+        elif key == "term":  # a boxed [v] name in the group's ink
+            p.setBrush(QColor(col.red(), col.green(), col.blue(), int(34 * hp)))
+            p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), int(175 + 80 * hp)), 1.6 if ring else 1.0))
+            p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 2, 2)
+            ink = col
+        else:  # default: the solid coloured pill
+            p.setBrush(QColor(col.red(), col.green(), col.blue(), int(215 + 40 * hp)))
+            p.drawRoundedRect(rect, ph / 2, ph / 2)
+            if ring:
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor(255, 255, 255, 230), 1.6))
+                p.drawRoundedRect(QRectF(x0 + 0.8, y0 + 0.8, pw - 1.6, ph - 1.6), ph / 2, ph / 2)
+            ink = QColor(11, 20, 29)
+        cx = x0 + lead + chev / 2 - 1
+        if key == "term":
+            p.setFont(f)
+            p.setPen(ink)
+            p.drawText(QRectF(x0 + lead - 1, y0, chev + 2, ph), Qt.AlignmentFlag.AlignCenter,
+                       "[v]" if self.open_p >= 0.5 else "[>]")
+        else:  # chevron: points down when open, turns to point right as the island slides shut
+            p.save()
+            p.translate(cx, y0 + ph / 2)
+            p.rotate(-90.0 * (1.0 - self.open_p))
+            pen = QPen(ink, 1.8)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPolyline(QPolygonF([QPointF(-3.2, -1.6), QPointF(0.0, 1.6), QPointF(3.2, -1.6)]))
+            p.restore()
         if label:
             p.setFont(f)
-            p.setPen(dark)
-            p.drawText(QRectF(x0 + pad + chev + 3, y0, pw, ph),
+            p.setPen(ink)
+            p.drawText(QRectF(x0 + lead + chev + 3, y0, pw, ph),
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
         if not self.compact and self.open_p < 0.999:  # tab count fades in as the island closes
             f.setBold(False)
             p.setFont(f)
             p.setPen(QColor(col.red(), col.green(), col.blue(), int(210 * (1.0 - self.open_p))))
-            p.drawText(QRectF(x0 + pw + 7, 0, 40, self.height()),
-                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, str(self.count))
+            p.drawText(QRectF(x0 + pw + 7, 0, 48, self.height()),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                       ("(%d)" if key == "term" else "%d") % self.count)
         p.end()
-
 
 MAX_PANES = 4
 
@@ -8292,9 +9053,12 @@ class TabList(DropTarget, QListWidget):
                     continue
                 c = QColor(color)
                 box = QRectF(u).adjusted(-1, 1, 1, -1) if horiz else QRectF(u).adjusted(1, 1, -1, -1)
-                p.setBrush(QColor(c.red(), c.green(), c.blue(), 32))
-                p.setPen(QPen(QColor(c.red(), c.green(), c.blue(), 95), 1))
-                p.drawRoundedRect(box, rr(14), rr(14))
+                ik = style_key()
+                fill_a, edge_a, rad = {"mac": (30, 85, rr(18)), "windows": (22, 70, 6.0), "term": (10, 140, 2.0)}.get(
+                    ik, (32, 95, rr(14)))
+                p.setBrush(QColor(c.red(), c.green(), c.blue(), fill_a))
+                p.setPen(QPen(QColor(c.red(), c.green(), c.blue(), edge_a), 1))
+                p.drawRoundedRect(box, rad, rad)
             p.end()
         if UI["mode"] == "mac":
             mp = QPainter(self.viewport())
@@ -11514,6 +12278,13 @@ def draw_glyph(p, kind, rect, color, width=1.6):
         path.lineTo(9.8, 10)
         path.closeSubpath()
         line((12, 13.5), (12, 20))
+    elif kind == "sliders":  # site settings: two sliders
+        line((4, 8), (6.7, 8))
+        line((11.3, 8), (20, 8))
+        line((4, 16), (12.7, 16))
+        line((17.3, 16), (20, 16))
+        path.addEllipse(QPointF(9, 8), 2.3, 2.3)
+        path.addEllipse(QPointF(15, 16), 2.3, 2.3)
     elif kind == "dots":
         p.setBrush(QColor(color))
         for cx in (5.5, 12, 18.5):
@@ -11842,15 +12613,111 @@ class ToolIcon(FadeButton):
         p.end()
 
 
+class EngineButton(FadeButton):
+    """The toolbar's search-engine button. It shows the current engine's logo. Click it for the engine popup; roll the mouse wheel
+    (or swipe a trackpad) over it to step through the engines, and the logos swap with a little slide, spin and fade."""
+    stepped = pyqtSignal(int)   # +1 = next engine, -1 = previous
+    GLYPH = ToolIcon.GLYPH + 2
+    SLIDE, SPIN = 10.0, 45.0
+
+    def __init__(self):
+        super().__init__(12)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._name, self._pm, self._old = None, None, None
+        self._dir, self._t = 1, 1.0
+        self._wacc, self._last_wheel, self._last_step = 0, 0.0, 0.0
+        self._swap = QVariantAnimation(self)
+        self._swap.setDuration(280)
+        self._swap.setStartValue(0.0)
+        self._swap.setEndValue(1.0)
+        self._swap.valueChanged.connect(self._set_t)
+        self._swap.finished.connect(self._swap_done)
+
+    def _set_t(self, v):
+        self._t = float(v)
+        self.update()
+
+    def _swap_done(self):
+        self._old = None
+        self._t = 1.0
+        self.update()
+
+    def show_engine(self, name, direction=0):
+        """Show this engine's logo. direction +1 / -1 animates the swap (the old logo leaves one way, the new one arrives from the other)."""
+        pm = engine_icon(name).pixmap(64, 64)
+        if direction and self._pm is not None and name != self._name:
+            self._old = self._pm
+            self._dir = 1 if direction > 0 else -1
+            self._swap.stop()
+            self._swap.setEasingCurve(mac_curve() if UI["mode"] == "mac" else QEasingCurve.Type.OutCubic)
+            self._t = 0.0
+            self._pm, self._name = pm, name
+            self._swap.start()
+        else:
+            self._swap.stop()
+            self._old, self._t = None, 1.0
+            self._pm, self._name = pm, name
+        self.update()
+
+    def wheelEvent(self, e):
+        d = e.angleDelta()
+        dy = d.y() or d.x()
+        if not dy or not self.isEnabled():
+            e.ignore()
+            return
+        e.accept()
+        now = time.monotonic()
+        if now - self._last_step < 0.16:   # a spinning wheel or trackpad glides on: take one engine at a time
+            return
+        if now - self._last_wheel > 0.4:
+            self._wacc = 0
+        self._last_wheel = now
+        self._wacc += dy
+        if abs(self._wacc) >= 60:   # a wheel notch is 120; trackpads send small pieces
+            step = 1 if self._wacc < 0 else -1   # wheel down = next engine
+            self._wacc = 0
+            self._last_step = now
+            self.stepped.emit(step)
+
+    @staticmethod
+    def _draw(p, pm, c, g, dy, rot, op, sc):
+        p.save()
+        p.setOpacity(max(0.0, min(1.0, op)))
+        p.translate(c.x(), c.y() + dy)
+        p.rotate(rot)
+        p.scale(sc, sc)
+        p.drawPixmap(QRectF(-g / 2.0, -g / 2.0, g, g), pm, QRectF(pm.rect()))
+        p.restore()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self._pm is None or self._pm.isNull():
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        c = QRectF(self.rect()).center()
+        g = float(self.GLYPH)
+        if UI["mode"] == "mac":  # the logo swells a little under the pointer and dips when pressed
+            g *= 1.0 + 0.12 * self._h - (0.08 if self.isDown() else 0.0)
+        t, sl, sp = self._t, self.SLIDE, self.SPIN
+        if self._old is not None and t < 1.0:
+            self._draw(p, self._old, c, g, -self._dir * t * sl, self._dir * t * sp, 1.0 - t, 1.0 - 0.3 * t)
+            self._draw(p, self._pm, c, g, self._dir * (1.0 - t) * sl, -self._dir * (1.0 - t) * sp, t, 0.7 + 0.3 * t)
+        else:
+            self._draw(p, self._pm, c, g, 0.0, 0.0, 1.0, 1.0)
+        p.end()
+
+
 # ----- customisable toolbar -----
 TB_MIME = "application/x-fjord-tbitem"
 # id -> label. Order here is the order hidden items show up in the customise tray.
 TB_ITEMS = {"side": "Sidebar", "back": "Back", "fwd": "Forward", "reload": "Reload", "engine": "Search engine",
-            "speed": "Speed", "vpn": "Privacy shield", "ext": "Extensions", "star": "Bookmark", "scratch": "Scratchpad", "chat": "Chat",
+            "speed": "Speed", "vpn": "Privacy shield", "ext": "Extensions", "star": "Bookmark", "site": "Site settings", "scratch": "Scratchpad", "chat": "Chat",
             "tabsearch": "Command palette", "uistyle": "Interface style", "menu": "Menu"}
 TB_GLYPHS = {"side": "sidebar", "back": "back", "fwd": "forward", "reload": "reload", "speed": "speed", "vpn": "shield",
-             "ext": "puzzle", "star": "star", "scratch": "scratch", "chat": "chat", "tabsearch": "search", "uistyle": "ui_default", "menu": "dots"}
-TB_DEFAULT = ["side", "back", "fwd", "reload", "addr", "engine", "speed", "vpn", "ext", "star", "scratch", "chat", "tabsearch", "menu"]
+             "ext": "puzzle", "star": "star", "site": "sliders", "scratch": "scratch", "chat": "chat", "tabsearch": "search", "uistyle": "ui_default", "menu": "dots"}
+TB_DEFAULT = ["side", "back", "fwd", "reload", "addr", "engine", "speed", "vpn", "ext", "star", "site", "scratch", "chat", "tabsearch", "menu"]
 TB_FIXED = ("addr", "menu")  # these always stay on the toolbar, so you can never lock yourself out
 TB_STRETCH = {"addr": 5, "space": 1}
 TB_SIDE_ONLY = ("scratch", "chat", "tabsearch")  # these two sit together at the bottom of the sidebar; in the toolbar only with tabs on top
@@ -11934,7 +12801,7 @@ class TbOverlay(QWidget):
 
     def item_at(self, pos):
         for _i, iid, w in self.ed.visible_items():
-            if iid != "addr" and w.geometry().contains(pos):
+            if iid != "addr" and self.ed.rect_of(w).contains(pos):
                 return iid
         return None
 
@@ -12013,7 +12880,7 @@ class TbOverlay(QWidget):
         for _i, iid, w in self.ed.visible_items():
             if iid == "addr":
                 continue
-            r = QRectF(w.geometry()).adjusted(0.5, 0.5, -0.5, -0.5)
+            r = QRectF(self.ed.rect_of(w)).adjusted(0.5, 0.5, -0.5, -0.5)
             hot = iid == self.hover
             p.setPen(Qt.PenStyle.NoPen)
             if iid == self.src:
@@ -12199,7 +13066,7 @@ class ToolbarEditor(QObject):
         self.seq = 1 + max([int(x.split("#")[1]) for x in self.order if "#" in x] or [0])
         self.widgets = {"addr": win.addr, "side": win.btn_side, "back": win.btn_back, "fwd": win.btn_fwd,
                         "reload": win.btn_reload, "engine": win.btn_engine, "speed": win.btn_speed,
-                        "vpn": win.btn_vpn, "ext": win.btn_ext, "star": win.btn_star,
+                        "vpn": win.btn_vpn, "ext": win.btn_ext, "star": win.btn_star, "site": win.btn_site,
                         "scratch": win.scratch_btn, "chat": win.chat_btn, "tabsearch": win.search_btn, "uistyle": win.btn_style, "menu": win.btn_menu}
         if not win.settings.get("tb_tabsearch_seeded"):  # toolbars saved before tab search got an icon: put it beside the Scratchpad once
             win.settings["tb_tabsearch_seeded"] = True
@@ -12216,6 +13083,14 @@ class ToolbarEditor(QObject):
                 self.order.insert(at, "chat")
                 if isinstance(win.settings.get("toolbar"), list):
                     win.settings["toolbar"] = list(self.order)
+            jsave("settings.json", win.settings)
+        if not win.settings.get("tb_site_seeded"):  # toolbars saved before site settings existed: put the new button beside the bookmark star once
+            win.settings["tb_site_seeded"] = True
+            if isinstance(win.settings.get("toolbar"), list):
+                at = self.order.index("star") + 1 if "star" in self.order else max(0, len(self.order) - 1)
+                for k, iid in enumerate([i for i in ("site",) if i not in self.order]):
+                    self.order.insert(at + k, iid)
+                win.settings["toolbar"] = list(self.order)
             jsave("settings.json", win.settings)
         self.overlay = TbOverlay(self)
         self.panel = TbPanel(self)
@@ -12315,15 +13190,20 @@ class ToolbarEditor(QObject):
                 out.append((i, iid, w))
         return out
 
+    def rect_of(self, w):
+        """A toolbar item's rectangle in toolbar coordinates (in the macOS style the buttons sit inside glass groups,
+        so their own geometry() is relative to the group, not to the toolbar the overlay is drawn on)."""
+        return QRect(w.mapTo(self.win.toolbar, QPoint(0, 0)), w.size())
+
     def slot_at(self, x):
         """Where would an item dropped at toolbar x land? -> (index into self.order, x of the drop marker)."""
         vis = self.visible_items()
         if not vis:
             return 0, 6
-        k = sum(1 for _i, _id, w in vis if w.geometry().center().x() < x)
+        k = sum(1 for _i, _id, w in vis if self.rect_of(w).center().x() < x)
         if k < len(vis):
-            return vis[k][0], vis[k][2].geometry().left() - 3
-        return vis[-1][0] + 1, vis[-1][2].geometry().right() + 4
+            return vis[k][0], self.rect_of(vis[k][2]).left() - 3
+        return vis[-1][0] + 1, self.rect_of(vis[-1][2]).right() + 4
 
     # --- changing the order ---
     def set_order(self, order):
@@ -12914,6 +13794,14 @@ class ScratchDrawer(DropTarget, DrawerSkin, QFrame):
         self.update_count()
         self.hide()
 
+        # ----- clipboard watcher: whatever gets copied lands in the Scratchpad too -----
+        self._clip_mute = 0.0      # until this time, clipboard changes are Fjord's own (password copy, Scratchpad copy)
+        self._clip_last = None     # fingerprint of the last thing taken, so one copy is never added twice
+        self._clip_timer = QTimer(self)
+        self._clip_timer.setSingleShot(True)
+        self._clip_timer.timeout.connect(self._clip_take)
+        QApplication.clipboard().dataChanged.connect(lambda: self._clip_timer.start(120))
+
     def sync_term(self):
         """Terminal style was switched on or off while the window is open: relabel the title and the box."""
         self.title_lbl.setText("~/scratchpad" if term_on() else "Scratchpad")
@@ -13029,6 +13917,62 @@ class ScratchDrawer(DropTarget, DrawerSkin, QFrame):
             p.setBrush(accent_color(16))
             p.drawRoundedRect(QRectF(self.rect()).adjusted(2.5, 2.5, -2.5, -2.5), rr(14), rr(14))
             p.end()
+
+    # ----- clipboard capture -----
+    CLIP_SECRET_FORMATS = ("x-kde-passwordManagerHint", "org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType",
+                           "ExcludeClipboardContentFromMonitorProcessing", "CanIncludeInClipboardHistory")
+
+    def mute_clip(self, secs=2.0):
+        """Fjord is about to put something on the clipboard itself (a password, a Scratchpad item): don't capture that."""
+        self._clip_mute = time.time() + secs
+
+    def _clip_take(self):
+        if not self.b.settings.get("scratch_clipboard", True) or time.time() < self._clip_mute:
+            return
+        md = QApplication.clipboard().mimeData()
+        if md is None or md.hasFormat(SCRATCH_MIME):
+            return
+        for f in self.CLIP_SECRET_FORMATS:   # password managers flag what they copy: never keep those
+            if md.hasFormat(f) and f != "CanIncludeInClipboardHistory":
+                return
+        try:
+            local = [u.toLocalFile() for u in md.urls() if u.isLocalFile()] if md.hasUrls() else []
+            img = md.imageData() if md.hasImage() else None
+            if isinstance(img, QPixmap):
+                img = img.toImage()
+            text = md.text() if md.hasText() else ""
+            if local:
+                key = ("f", tuple(local[:20]))
+            elif isinstance(img, QImage) and not img.isNull():
+                key = ("i", img.width(), img.height(), img.sizeInBytes(), img.cacheKey())
+            elif text.strip():
+                key = ("t", text.strip()[:SCRATCH_MAX_TEXT])
+            else:
+                return
+            if key == self._clip_last:
+                return
+            self._clip_last = key
+            n, errs = 0, []
+            if local:
+                for f in local[:20]:
+                    try:
+                        if Path(f).is_file() and self.store.add_file(f):
+                            n += 1
+                    except (ValueError, OSError) as ex:
+                        errs.append(str(ex))
+            elif key[0] == "i":
+                self.store.add_qimage(img)
+                n = 1
+            elif self.store.add_text(text):
+                n = 1
+            if n:
+                self.changed()
+                self.b.scratch_btn.bump()
+                self.b.toast("Copied \u2192 added to Scratchpad", 1800)
+            elif errs:
+                self.b.toast(errs[0], 3000)
+        except Exception:
+            log_error("scratchpad clipboard capture")
 
     @staticmethod
     def _html_img(markup):
@@ -13197,6 +14141,7 @@ class ScratchDrawer(DropTarget, DrawerSkin, QFrame):
         if it["kind"] in ("image", "file") and self.store.path(it) is None:
             self.b.toast("That file is no longer in the Scratchpad", 3000)
             return
+        self.mute_clip()
         QApplication.clipboard().setMimeData(self._mime(it))
         self.b.toast("Copied to clipboard", 2200)
 
@@ -13351,6 +14296,9 @@ class ChatConn:
             pass
         if first is not None:   # our hello must be the very first frame, before the reader can queue anything else
             self.q.put(first)
+
+    def start(self):
+        """Start the reader and writer threads (called once the core already knows about this connection)."""
         threading.Thread(target=self._reader, daemon=True).start()
         threading.Thread(target=self._writer, daemon=True).start()
 
@@ -13475,6 +14423,7 @@ class ChatCore:
         self.targets = None                  # optional fixed [(host, port)] list instead of LAN broadcasts
         self._bc_cache, self._bc_t = [], 0.0
         self.dialing = {}                    # peer_id -> time we last dialled it
+        self.first_heard = {}                # peer_id -> when we first heard its broadcast (for the fallback dial)
 
     # ---------------- lifecycle ----------------
     def emit(self, name, **kw):
@@ -13539,6 +14488,7 @@ class ChatCore:
             self.conns.clear()
             self.pending.clear()
             self.seen.clear()
+            self.first_heard.clear()
         self.emit("peers")
 
     def set_room(self, code, announce=True):
@@ -13550,6 +14500,7 @@ class ChatCore:
                 c.close()
             with self.lock:
                 self.seen.clear()
+                self.first_heard.clear()
             self.emit("peers")
 
     def set_profile(self, name=None, color=None, status=None):
@@ -13609,6 +14560,7 @@ class ChatCore:
                 continue
             c = ChatConn(self, sock, addr, outbound=False, first=self._hello("hello"))
             self.pending.add(c)
+            c.start()
 
     def _hello(self, t):
         return {"t": t, "v": 1, "id": self.me["id"], "name": self.me["name"], "color": self.me["color"],
@@ -13640,8 +14592,11 @@ class ChatCore:
             with self.lock:
                 new = pid not in self.seen
                 self.seen[pid] = info
-            if (pid not in self.conns and self.me["id"] < pid   # the lower id dials, so two peers never both do
-                    and time.time() - self.dialing.get(pid, 0) > 5):
+                heard = self.first_heard.setdefault(pid, time.time())
+            # the lower id dials straight away, so two peers normally never both do; the higher id only steps in if
+            # no connection exists a few seconds later (e.g. our broadcasts reach them but theirs don't reach us)
+            may_dial = self.me["id"] < pid or time.time() - heard > 6
+            if pid not in self.conns and may_dial and time.time() - self.dialing.get(pid, 0) > 5:
                 self.dialing[pid] = time.time()
                 self.connect(addr[0], port, expect=pid)
             if new:
@@ -13675,10 +14630,13 @@ class ChatCore:
             with self.lock:
                 for pid in [p for p, i in self.seen.items() if now - i["last"] > CHAT_PEER_TIMEOUT and p not in self.conns]:
                     del self.seen[pid]
+                    self.first_heard.pop(pid, None)
                     changed = True
             for c in list(self.pending):    # never said hello
-                if now - c.t_hello > 6:
+                if c.peer_id is None and now - c.t_hello > 6:
                     c.close()
+                elif c.peer_id is not None:
+                    self.pending.discard(c)
             if changed:
                 self.emit("peers")
 
@@ -13696,6 +14654,7 @@ class ChatCore:
                 return
             c = ChatConn(self, s, (host, port), outbound=True, first=self._hello("hello"))
             self.pending.add(c)
+            c.start()
         threading.Thread(target=run, daemon=True).start()
 
     # ---------------- incoming frames ----------------
@@ -14376,6 +15335,9 @@ class ChatHub(QObject):
             return False
         if conv != "*" and not self.online(conv):
             self.b.toast("%s is offline" % self.peer_name(conv), 2500)
+            return False
+        if conv == "*" and not self.core.conns:
+            self.b.toast("Nobody else is connected yet, so nobody would get that. See the tips in the chat panel.", 4500)
             return False
         return True
 
@@ -15786,7 +16748,9 @@ class ChatDrawer(DrawerSkin, QFrame):
             alone = not self.hub.core.conns
             if self.conv == "*":
                 self.hint.setText("Nobody else is here yet.\n\nOpen Fjord on another computer on this network and turn on Chat, "
-                                  "and you'll see each other here. If nobody shows up, try “Connect by address” in the settings."
+                                  "and you'll see each other here.\n\nNobody showing up? Both computers need to be on the same Wi-Fi or "
+                                  "network (guest and school networks often block this), the same room code, and Fjord has to be allowed "
+                                  "through the firewall on private networks. Or use “Connect by address” in the settings."
                                   if alone else "No messages yet. Say hello — everyone online will see it.")
             else:
                 self.hint.setText("No messages with %s yet." % self.hub.peer_name(self.conv))
@@ -18368,35 +19332,179 @@ class DefaultBrowserBar(QFrame):
         self.deleteLater()
 
 
+class PermIcon(QWidget):
+    """A small line icon for a permission prompt (camera, microphone, location, bell, clipboard, pointer, fonts), drawn with
+    the painter so it is crisp at any scale and takes the accent colour."""
+    def __init__(self, kind, parent=None):
+        super().__init__(parent)
+        self.kind = "camera" if kind == "camera+mic" else kind
+        self.setFixedSize(22, 22)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.scale(self.width() / 24.0, self.height() / 24.0)
+        pen = QPen(accent_color(), 1.8)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        k, F, P = self.kind, QRectF, QPointF
+        if k == "camera":
+            p.drawRoundedRect(F(2.5, 6.5, 13, 11), 3, 3)
+            p.drawPolygon(QPolygonF([P(15.5, 10.5), P(21, 7.5), P(21, 16.5), P(15.5, 13.5)]))
+        elif k == "mic":
+            p.drawRoundedRect(F(8.8, 2.8, 6.4, 11.4), 3.2, 3.2)
+            p.drawArc(F(5.5, 6.5, 13, 11), 180 * 16, 180 * 16)
+            p.drawLine(P(12, 17.5), P(12, 21))
+            p.drawLine(P(8.5, 21), P(15.5, 21))
+        elif k == "geo":
+            path = QPainterPath()
+            path.moveTo(12, 21.5)
+            path.cubicTo(8, 17, 5, 13.5, 5, 9.5)
+            path.cubicTo(5, 5.6, 8.1, 2.8, 12, 2.8)
+            path.cubicTo(15.9, 2.8, 19, 5.6, 19, 9.5)
+            path.cubicTo(19, 13.5, 16, 17, 12, 21.5)
+            p.drawPath(path)
+            p.drawEllipse(P(12, 9.5), 2.6, 2.6)
+        elif k == "notif":
+            path = QPainterPath()
+            path.moveTo(5.5, 17.5)
+            path.cubicTo(7, 16, 7.5, 14, 7.5, 11)
+            path.cubicTo(7.5, 8, 9.5, 6, 12, 6)
+            path.cubicTo(14.5, 6, 16.5, 8, 16.5, 11)
+            path.cubicTo(16.5, 14, 17, 16, 18.5, 17.5)
+            path.closeSubpath()
+            p.drawPath(path)
+            p.drawLine(P(12, 3.4), P(12, 6))
+            p.drawArc(F(9.8, 18.4, 4.4, 3.4), 180 * 16, 180 * 16)
+        elif k == "clip":
+            p.drawRoundedRect(F(5, 4.5, 14, 17), 2.8, 2.8)
+            p.drawRoundedRect(F(9, 2.5, 6, 4), 1.6, 1.6)
+            p.drawLine(P(8.5, 11.5), P(15.5, 11.5))
+            p.drawLine(P(8.5, 15.5), P(13, 15.5))
+        elif k == "lock":  # pointer arrow
+            p.drawPolygon(QPolygonF([P(6.5, 3.5), P(6.5, 18), P(10.2, 14.6), P(13, 20.8), P(15.4, 19.7),
+                                     P(12.7, 13.6), P(17.8, 13.2)]))
+        elif k == "fonts":  # "Aa"
+            p.drawLine(P(3.5, 19), P(8.5, 5.5))
+            p.drawLine(P(8.5, 5.5), P(13.5, 19))
+            p.drawLine(P(5.4, 14.2), P(11.6, 14.2))
+            p.drawEllipse(P(17.2, 15.6), 2.9, 2.9)
+            p.drawLine(P(20.1, 12.6), P(20.1, 18.8))
+        p.end()
+
+
+PERM_BAR_H, PERM_BTN_H, PERM_CHIP = 52, 32, 34          # bar height, button height, icon chip size (px)
+PERM_BAR_R = {"default": 26, "mac": 26, "windows": 14, "term": 14}   # bar corner radius per look; every button is a full pill
+PERM_HOST = {"default": "#ffffff", "mac": "#ffffff", "windows": "#ffffff", "term": "#2bff6a"}   # the site name in the prompt
+
+
+def perm_bar_css(mode):
+    """The permission prompt's own look for each interface style (Default, macOS, Windows, Terminal).
+    Every button is a true pill. Radii are written as @BAR@ / @BTN@ / @CHIP@ and filled in AFTER themed(): Qt only draws a
+    perfect pill when the radius is exactly half the widget's height (an oversized value like 99px comes out near-square),
+    and themed() would also shrink the radii again whenever the corner scale is below 100% (the Terminal style uses 12%).
+    #x is the dismiss circle, #block / #once / #save are Block, Allow once and Allow; QFrame#chip holds the icon."""
+    if mode == "term":  # a green-on-black shell prompt: outlined pills that fill in on hover, Block flashes red
+        return ("PermissionBar{background:#030704;border:1px solid #12b84a;border-radius:@BAR@;}"
+                "QFrame#chip{background:rgba(43,255,106,.10);border:1px solid #12b84a;border-radius:@CHIP@;}"
+                "QLabel{color:#8dffb0;font-size:13px;background:transparent;}"
+                "QPushButton{padding:0 16px;border:1px solid #12b84a;border-radius:@BTN@;background:transparent;color:#2bff6a;font-size:12px;}"
+                "QPushButton:hover{background:#2bff6a;color:#030704;}"
+                "QPushButton:pressed{background:#12b84a;color:#030704;}"
+                "QPushButton#x{padding:0;}"
+                "QPushButton#block:hover{background:#ff5f56;border-color:#ff5f56;color:#030704;}"
+                "QPushButton#save{background:#2bff6a;color:#030704;font-weight:700;}"
+                "QPushButton#save:hover{background:#8dffb0;border-color:#8dffb0;}")
+    if mode == "windows":  # flat Fluent card in neutral grey; soft pills, solid accent Allow, ghost dismiss
+        return ("PermissionBar{background:#172431;border:1px solid rgba(255,255,255,.10);border-radius:@BAR@;}"
+                "QFrame#chip{background:rgba(79,176,232,.18);border:none;border-radius:@CHIP@;}"
+                "QLabel{color:#d6d6d6;font-size:13px;background:transparent;}"
+                "QPushButton{padding:0 16px;border:1px solid rgba(255,255,255,.08);border-radius:@BTN@;background:rgba(255,255,255,.06);color:#f2f2f2;font-size:12px;}"
+                "QPushButton:hover{background:rgba(255,255,255,.12);}"
+                "QPushButton:pressed{background:rgba(255,255,255,.04);}"
+                "QPushButton#x{padding:0;border:none;background:transparent;}"
+                "QPushButton#x:hover{background:rgba(255,255,255,.10);}"
+                "QPushButton#block:hover{background:rgba(255,99,99,.22);border-color:rgba(255,99,99,.55);}"
+                "QPushButton#save{background:#4fb0e8;border:1px solid #4fb0e8;color:#0b141d;font-weight:600;}"
+                "QPushButton#save:hover{background:#7ef0d0;border-color:#7ef0d0;}")
+    if mode == "mac":  # frosted capsule, soft pills with no outlines, solid accent Allow
+        return ("PermissionBar{background:rgba(28,32,38,225);border:1px solid rgba(255,255,255,.16);border-radius:@BAR@;}"
+                "QFrame#chip{background:rgba(255,255,255,.10);border:none;border-radius:@CHIP@;}"
+                "QLabel{color:#c4cad1;font-size:13px;background:transparent;}"
+                "QPushButton{padding:0 18px;border:none;border-radius:@BTN@;background:rgba(255,255,255,.10);color:#ffffff;font-size:12px;}"
+                "QPushButton:hover{background:rgba(255,255,255,.20);}"
+                "QPushButton:pressed{background:rgba(255,255,255,.28);}"
+                "QPushButton#x{padding:0;}"
+                "QPushButton#block:hover{background:rgba(255,95,86,.40);}"
+                "QPushButton#save{background:#4fb0e8;color:#0b141d;font-weight:600;}"
+                "QPushButton#save:hover{background:#7ef0d0;}")
+    return ("PermissionBar{background:#172431;border:1px solid rgba(79,176,232,.35);border-radius:@BAR@;}"   # default: glacial pill
+            "QFrame#chip{background:rgba(79,176,232,.16);border:none;border-radius:@CHIP@;}"
+            "QLabel{color:#9fb4c4;font-size:13px;background:transparent;}"
+            "QPushButton{padding:0 16px;border:none;border-radius:@BTN@;background:rgba(255,255,255,.08);color:#e6eff6;font-size:12px;}"
+            "QPushButton:hover{background:rgba(255,255,255,.16);}"
+            "QPushButton:pressed{background:rgba(255,255,255,.05);}"
+            "QPushButton#x{padding:0;}"
+            "QPushButton#block:hover{background:rgba(255,107,107,.28);color:#ffe0e0;}"
+            "QPushButton#once{background:transparent;border:1px solid rgba(79,176,232,.50);}"
+            "QPushButton#once:hover{background:rgba(79,176,232,.20);}"
+            "QPushButton#save{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #4fb0e8,stop:1 #7ef0d0);color:#0b141d;font-weight:600;}"
+            "QPushButton#save:hover{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #7ef0d0,stop:1 #4fb0e8);}")
+
+
 class PermissionBar(QFrame):
-    """'<site> wants to use your camera / microphone' prompt. Stays up until the person answers, the page navigates away,
-    or its tab closes (it hides while another tab is showing and comes back when its tab does)."""
+    """'<site> wants to use your camera / microphone / location...' prompt. Slides in softly, stays up until the person answers,
+    the page navigates away, or its tab closes (it hides while another tab is showing and comes back when its tab does)."""
     def __init__(self, browser, item):
         super().__init__(browser)
         self.browser, self.item = browser, item
-        self.setStyleSheet(themed(
-            "PermissionBar{background:#172431;border:1px solid rgba(79,176,232,.35);border-radius:14px;}"
-            "QLabel{color:#e6eff6;font-size:13px;background:transparent;}"
-            "QPushButton{padding:6px 14px;border:none;border-radius:99px;background:rgba(255,255,255,.08);color:#e6eff6;font-size:12px;}"
-            "QPushButton:hover{background:rgba(255,255,255,.16);}"
-            "QPushButton#x{padding:6px 10px;}"
-            "QPushButton#save{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #4fb0e8,stop:1 #7ef0d0);color:#0b141d;font-weight:600;}"))
+        self._leaving = False
+        mode = "term" if term_on() else UI["mode"]
+        css = themed(perm_bar_css(mode))
+        css = (css.replace("@BAR@", "%dpx" % PERM_BAR_R[mode]).replace("@BTN@", "%dpx" % (PERM_BTN_H // 2))
+                  .replace("@CHIP@", "%dpx" % (PERM_CHIP // 2)))
+        self.setStyleSheet(css)
+        self.setFixedHeight(PERM_BAR_H)     # radius = half the height, so the ends are exact semicircles
         host = item["host"]
         host = host if len(host) <= 38 else host[:37] + "\u2026"
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(16, 10, 10, 10)
+        m = (PERM_BAR_H - PERM_CHIP) // 2    # the chip is the tallest thing in the bar, so it sets the margins
+        lay.setContentsMargins(m, m, (PERM_BAR_H - PERM_BTN_H) // 2, m)
         lay.setSpacing(8)
-        lab = QLabel("%s wants to use your %s" % (host, PERM_WHAT[item["kind"]]))
+        chip = QFrame()                      # the icon sits in a round chip
+        chip.setObjectName("chip")
+        chip.setFixedSize(PERM_CHIP, PERM_CHIP)
+        cl = QHBoxLayout(chip)
+        cl.setContentsMargins(0, 0, 0, 0)
+        if mode == "term":
+            icon = QLabel("$")
+            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon.setStyleSheet("color:#2bff6a;font-weight:700;background:transparent;border:none;")
+        else:
+            icon = PermIcon(item["kind"])
+        cl.addWidget(icon, 0, Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(chip)
+        lab = QLabel('<span style="color:%s;font-weight:600">%s</span> wants to %s'
+                     % (PERM_HOST[mode], html.escape(host), html.escape(PERM_ASK[item["kind"]])))
+        lab.setTextFormat(Qt.TextFormat.RichText)
         lab.setToolTip(item["site"])
         lay.addWidget(lab)
         lay.addStretch(1)
         b_x, b_block, b_once, b_allow = QPushButton("\u2715"), QPushButton("Block"), QPushButton("Allow once"), QPushButton("Allow")
         b_x.setObjectName("x")
+        b_block.setObjectName("block")
+        b_once.setObjectName("once")
+        b_allow.setObjectName("save")
         b_x.setToolTip("Dismiss (the site can ask again)")
         b_block.setToolTip("Block this site and remember the choice")
         b_once.setToolTip("Allow now, ask again next time")
         b_allow.setToolTip("Allow this site and remember the choice")
-        b_allow.setObjectName("save")
+        b_x.setFixedSize(PERM_BTN_H, PERM_BTN_H)    # a true circle
+        for btn in (b_block, b_once, b_allow):
+            btn.setFixedHeight(PERM_BTN_H)          # radius = half the height, so every end is a perfect semicircle
         b_x.clicked.connect(lambda: self.browser.perm_decide(self.item, False, False))
         b_block.clicked.connect(lambda: self.browser.perm_decide(self.item, False, True))
         b_once.clicked.connect(lambda: self.browser.perm_decide(self.item, True, False))
@@ -18407,15 +19515,319 @@ class PermissionBar(QFrame):
         self.adjustSize()
         self.place()
 
+    def target(self):
+        return QPoint(max(12, self.browser.width() - self.width() - 28), 64)
+
     def place(self):
-        self.move(max(12, self.browser.width() - self.width() - 28), 64)
+        if not self._leaving:
+            self.move(self.target())
+
+    def animate_in(self):
+        """Glide down from just above while fading in."""
+        end = self.target()
+        fade_widget(self, 0.0, 1.0, 260)
+        animate(self, b"pos", end - QPoint(0, 18), end, 380)
 
     def close_now(self):
         if getattr(self.browser, "_perm_bar", None) is self:
             self.browser._perm_bar = None
-        self.hide()
-        self.deleteLater()
+        if self._leaving:
+            return
+        self._leaving = True
+
+        def gone():
+            try:
+                self.hide()
+                self.deleteLater()
+            except RuntimeError:
+                pass
+        try:
+            fade_widget(self, 1.0, 0.0, 180, done=gone)
+            animate(self, b"pos", self.pos(), self.pos() - QPoint(0, 10), 180)
+        except RuntimeError:
+            gone()
         self.browser.place_bars()
+
+
+# ----- history randomiser -----
+# Optional and off by default. While it is on, every so often Fjord runs ONE ordinary search or opens ONE well-known site in an
+# invisible, muted page and adds it to your history, so your own browsing sits among everyday noise.
+# Safety: it can only ever visit what is in the lists below (a results page for a listed kind of search, or a listed site). It never
+# follows links or search results, never opens a tab, and uses its own memory-only profile, so no cookies, sign-ins or site data are
+# shared with your tabs or kept afterwards (and accounts you are signed in to never see these searches).
+NOISE_RATES = {"light": (480, 1200, "about every 8-20 minutes"),
+               "normal": (180, 540, "about every 3-9 minutes"),
+               "heavy": (60, 240, "about every 1-4 minutes")}   # seconds between visits (min, max) and how that reads
+NOISE_KEEP = 600   # generated entries kept at once; the oldest go first, so they can never crowd your own history out
+NOISE_SEARCHES = [
+    # cooking
+    "easy banana bread recipe", "how long to boil eggs", "chicken fried rice recipe", "best way to cook salmon",
+    "vegetarian lasagna recipe", "how to make pancakes from scratch", "homemade pizza dough", "overnight oats ideas",
+    "how to cook quinoa", "creamy tomato soup recipe", "chocolate chip cookies recipe", "how to make iced coffee at home",
+    "healthy lunch ideas for work", "how to season a cast iron pan", "one pot pasta recipes", "easy weeknight curry",
+    "how to make a sourdough starter", "how to bake a potato in the oven", "how to make guacamole", "best homemade granola",
+    # home, garden and DIY
+    "how to hang a picture frame", "how to unclog a sink", "how to get a stain out of a shirt", "best houseplants for low light",
+    "how to repot a plant", "how to paint a room", "how to clean a microwave", "small living room layout ideas",
+    "how to fix a squeaky door", "how to organise a closet", "how to descale a kettle", "how to clean white sneakers",
+    "how often to water succulents", "how to grow basil indoors", "herb garden ideas for a balcony", "how to wash a wool sweater",
+    "how to change a light bulb", "how to start a compost bin", "how to fold a fitted sheet", "tips for a tidy desk",
+    # tech, everyday
+    "how to take a screenshot on a laptop", "how to speed up an old laptop", "best free photo editor", "how to back up photos",
+    "how to clear browser cache", "keyboard shortcuts for beginners", "how to connect headphones to a computer",
+    "how to set up a printer", "wifi router placement tips", "how to make a chart in a spreadsheet", "python tutorial for beginners",
+    "how to learn touch typing", "best note taking apps", "how to merge pdf files", "how to convert heic to jpg",
+    "how to record your screen", "how to make a slideshow", "how to change a phone wallpaper",
+    # curiosity
+    "how many moons does jupiter have", "why is the sky blue", "how do airplanes fly", "tallest mountains in the world",
+    "how do bees make honey", "how does a rainbow form", "what causes the tides", "history of the bicycle", "how do magnets work",
+    "interesting facts about octopuses", "how big is the pacific ocean", "what is the largest desert", "how are volcanoes formed",
+    "who invented the printing press", "what is photosynthesis", "how do solar panels work", "fun facts about space",
+    "how deep is the ocean", "what is the speed of light", "how do plants grow", "why do leaves change color",
+    "how do lighthouses work", "how is chocolate made", "how do clocks work", "what is the biggest animal on earth",
+    # travel, generic
+    "best time to visit japan", "cheap weekend getaways", "packing list for a beach holiday", "best national parks to visit",
+    "how to plan a road trip", "iceland northern lights season", "best beaches in thailand", "train travel across europe",
+    "how to pack a carry on only", "best hiking trails for beginners", "what to pack for a camping trip", "scenic drives in new zealand",
+    # hobbies, fitness, learning
+    "beginner yoga routine", "how to start running", "best stretches after a run", "how to learn guitar chords",
+    "how to start a vegetable garden", "easy watercolor painting ideas", "how to knit a scarf", "origami crane instructions",
+    "chess openings for beginners", "how to take better photos with a phone", "bird watching for beginners",
+    "beginner woodworking projects", "how to draw a cat", "best board games for two players", "jigsaw puzzle tips",
+    "how to learn spanish quickly", "benefits of walking every day", "10 minute morning workout", "how to meditate for beginners",
+    "how to play badminton", "how to play pickleball", "how to bake bread at home", "how to learn to swim as an adult",
+    # entertainment and culture
+    "best classic movies to watch", "good books to read this year", "best sitcoms of all time", "relaxing instrumental playlist",
+    "best podcasts for learning", "famous paintings in the louvre", "science fiction book recommendations",
+    "best documentaries about nature", "movies for family night", "cozy mystery books", "best animated movies", "classical music for studying",
+    # shopping, everyday life
+    "best running shoes for beginners", "how to choose a backpack", "best budget headphones", "how to pick a mattress",
+    "best reusable water bottle", "how to measure shoe size", "gift ideas for a coworker", "birthday gift ideas for dad",
+    "best desk lamps for reading", "how to choose a good umbrella", "best tote bags", "how to pick ripe avocados",
+    # weather, time, conversions
+    "weather this weekend", "sunrise and sunset times", "time in london now", "convert celsius to fahrenheit",
+    "what time zone is new york", "currency converter dollars to euros", "convert cups to grams", "public holidays this year",
+    # animals and nature
+    "cute dog breeds for apartments", "how long do goldfish live", "why do cats purr", "how to train a puppy to sit",
+    "types of owls", "how fast can a cheetah run", "best flowers to plant in spring", "what do hummingbirds eat",
+]
+NOISE_DISHES = ["lasagna", "banana bread", "chicken curry", "pad thai", "tomato soup", "pancake", "guacamole", "vegetable chili",
+                "shakshuka", "mac and cheese", "apple pie", "fried rice", "minestrone", "brownie", "ratatouille", "pesto pasta",
+                "vegetable stir fry", "hummus", "focaccia", "banana pancake", "lentil soup", "greek salad", "blueberry muffin",
+                "potato salad", "beef stew", "caprese salad", "oatmeal cookie", "falafel", "carrot cake", "garlic bread"]
+NOISE_CITIES = ["Lisbon", "Kyoto", "Rome", "Vancouver", "Sydney", "Reykjavik", "Edinburgh", "Cape Town", "Barcelona", "Prague",
+                "Seoul", "Singapore", "Amsterdam", "Vienna", "Copenhagen", "Melbourne", "Toronto", "Dublin", "Florence", "Bangkok",
+                "Budapest", "Auckland", "Oslo", "Lyon", "Porto", "Zurich", "Helsinki", "Wellington", "Osaka", "Marrakech"]
+NOISE_HOBBIES = ["gardening", "photography", "yoga", "guitar", "chess", "baking", "python programming", "watercolour painting",
+                 "bird watching", "running", "knitting", "spanish", "origami", "astronomy", "journaling", "woodworking", "cycling",
+                 "meditation", "drawing", "hiking", "pottery", "calligraphy", "sketching", "camping"]
+NOISE_HOWTO = ["tie a tie", "boil rice", "make cold brew coffee", "fold a paper airplane", "grow tomatoes", "clean a cast iron pan",
+               "make a paper boat", "iron a shirt", "make homemade bread", "sharpen a kitchen knife", "plant a tree", "make lemonade",
+               "brew green tea", "tie a scarf", "wrap a gift", "make a bookshelf", "read a map", "make a paper crane", "poach an egg"]
+NOISE_BEST = ["budget headphones", "running shoes for beginners", "desk lamps", "reusable water bottles", "houseplants for beginners",
+              "camping tents", "portable speakers", "backpacks for travel", "electric kettles", "cookbooks for beginners",
+              "board games for families", "walking shoes", "coffee makers", "hiking backpacks", "notebooks for journaling"]
+NOISE_SITES = [
+    # reference and learning
+    "https://www.wikipedia.org/", "https://www.britannica.com/", "https://www.khanacademy.org/", "https://www.ted.com/",
+    "https://www.coursera.org/", "https://www.duolingo.com/", "https://www.gutenberg.org/", "https://archive.org/",
+    "https://www.python.org/", "https://developer.mozilla.org/", "https://stackoverflow.com/", "https://www.howstuffworks.com/",
+    "https://en.wikipedia.org/wiki/Mount_Everest", "https://en.wikipedia.org/wiki/Solar_System", "https://en.wikipedia.org/wiki/Honey_bee",
+    "https://en.wikipedia.org/wiki/Pizza", "https://en.wikipedia.org/wiki/Great_Wall_of_China", "https://en.wikipedia.org/wiki/Photosynthesis",
+    "https://en.wikipedia.org/wiki/Chess", "https://en.wikipedia.org/wiki/Volcano", "https://en.wikipedia.org/wiki/Giant_panda",
+    "https://en.wikipedia.org/wiki/Eiffel_Tower", "https://en.wikipedia.org/wiki/Origami", "https://en.wikipedia.org/wiki/Jazz",
+    "https://en.wikipedia.org/wiki/Coffee", "https://en.wikipedia.org/wiki/Tea", "https://en.wikipedia.org/wiki/Rainforest",
+    "https://en.wikipedia.org/wiki/Bicycle", "https://en.wikipedia.org/wiki/Lighthouse", "https://en.wikipedia.org/wiki/Aurora",
+    "https://en.wikipedia.org/wiki/Moon", "https://en.wikipedia.org/wiki/Pacific_Ocean", "https://en.wikipedia.org/wiki/Sahara",
+    "https://en.wikipedia.org/wiki/Piano", "https://en.wikipedia.org/wiki/Butterfly", "https://en.wikipedia.org/wiki/Chocolate",
+    "https://en.wikipedia.org/wiki/Machu_Picchu", "https://en.wikipedia.org/wiki/Sushi", "https://en.wikipedia.org/wiki/Telescope",
+    # science, nature, museums
+    "https://www.nasa.gov/", "https://science.nasa.gov/", "https://www.esa.int/", "https://www.planetary.org/",
+    "https://www.nationalgeographic.com/", "https://kids.nationalgeographic.com/", "https://www.smithsonianmag.com/", "https://www.si.edu/",
+    "https://www.metmuseum.org/", "https://www.nhm.ac.uk/", "https://www.exploratorium.edu/", "https://www.audubon.org/",
+    "https://www.nps.gov/", "https://www.worldwildlife.org/", "https://www.sandiegozoo.org/",
+    # food, home, garden, making
+    "https://www.allrecipes.com/", "https://www.bbcgoodfood.com/", "https://www.seriouseats.com/", "https://www.simplyrecipes.com/",
+    "https://www.epicurious.com/", "https://www.instructables.com/", "https://www.wikihow.com/", "https://www.thespruce.com/",
+    "https://www.gardenersworld.com/", "https://www.ikea.com/", "https://www.etsy.com/", "https://www.rei.com/",
+    # travel, weather, maps, time
+    "https://www.lonelyplanet.com/", "https://www.tripadvisor.com/", "https://www.openstreetmap.org/", "https://www.timeanddate.com/",
+    "https://www.accuweather.com/", "https://www.wunderground.com/", "https://www.metoffice.gov.uk/",
+    # books, films, games
+    "https://www.goodreads.com/", "https://www.imdb.com/", "https://www.rottentomatoes.com/", "https://www.chess.com/", "https://lichess.org/",
+]
+
+
+def make_noise_query():
+    """One ordinary search: a ready-made one, or a template filled in from the vetted lists above."""
+    r, c = random.random(), random.choice
+    if r < 0.45:
+        return c(NOISE_SEARCHES)
+    if r < 0.58:
+        return "%s recipe" % c(NOISE_DISHES)
+    if r < 0.70:
+        return "things to do in %s" % c(NOISE_CITIES)
+    if r < 0.78:
+        return "weather in %s" % c(NOISE_CITIES)
+    if r < 0.84:
+        return "%s travel guide" % c(NOISE_CITIES)
+    if r < 0.92:
+        return "%s for beginners" % c(NOISE_HOBBIES)
+    if r < 0.96:
+        return "how to %s" % c(NOISE_HOWTO)
+    return "best %s %d" % (c(NOISE_BEST), datetime.date.today().year)
+
+
+class NoisePage(QWebEnginePage):
+    """The invisible, muted page each randomiser visit loads into. It has no window, and every dialog, popup, permission
+    request (camera, location, notifications...) and non-web address is refused."""
+
+    def __init__(self, profile, parent):
+        super().__init__(profile, parent)
+        self.setAudioMuted(True)
+        if QWebEnginePermission is not None and hasattr(self, "permissionRequested"):
+            self.permissionRequested.connect(lambda perm: perm.deny())      # Qt 6.8+
+        else:
+            self.featurePermissionRequested.connect(self._deny)              # older Qt
+
+    def _deny(self, origin, feature):
+        self.setFeaturePermission(origin, feature, QWebEnginePage.PermissionPolicy.PermissionDeniedByUser)
+
+    def createWindow(self, _kind):
+        return None
+
+    def acceptNavigationRequest(self, url, nav_type, is_main):
+        if is_main and url.scheme() not in ("http", "https"):
+            return False
+        return super().acceptNavigationRequest(url, nav_type, is_main)
+
+    def javaScriptAlert(self, _url, _msg):
+        pass
+
+    def javaScriptConfirm(self, _url, _msg):
+        return False
+
+    def javaScriptPrompt(self, _url, _msg, _default):
+        return False, ""
+
+    def javaScriptConsoleMessage(self, level, message, line, source):
+        pass
+
+
+class HistoryNoise(QObject):
+    """Runs the history randomiser: waits a random while, loads one search or site in a NoisePage, records it in the history,
+    lets it 'sit' for a few seconds like someone reading, then throws the page away and waits again."""
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.profile = None
+        self.page = None
+        self.recent = []      # the last few picks, so the same one doesn't come round twice in a row
+        self._expect = None   # for a search: the word the results page's address must contain to count as a real results page
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.fire)
+        self.guard = QTimer(self)   # a page that never finishes loading is dropped
+        self.guard.setSingleShot(True)
+        self.guard.timeout.connect(self._give_up)
+
+    def rate(self):
+        r = self.win.settings.get("history_noise_rate")
+        return r if r in NOISE_RATES else "normal"
+
+    def start(self):
+        if PRIVATE or self.timer.isActive() or self.page is not None:
+            return
+        self.timer.start(random.randint(30000, 120000))   # the first visit comes a little while after switching on / launching
+
+    def stop(self):
+        self.timer.stop()
+        self.guard.stop()
+        self._drop()
+
+    def schedule(self):
+        lo, hi, _label = NOISE_RATES[self.rate()]
+        self.timer.start(int(random.uniform(lo, hi) * 1000))
+
+    def reschedule(self):
+        """The pace was changed: apply it to the visit that is waiting."""
+        if self.timer.isActive():
+            self.schedule()
+
+    def _profile(self):
+        if self.profile is None:   # no storage name = off the record: nothing is kept, nothing is shared with the tabs' profile
+            p = QWebEngineProfile(self.win)
+            p.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
+            p.setHttpCacheMaximumSize(8 * 1024 * 1024)
+            p.downloadRequested.connect(lambda d: d.cancel())
+            self._interceptor = AdInterceptor(self.win.adblock)   # same ad and tracker blocking as the tabs
+            p.setUrlRequestInterceptor(self._interceptor)
+            self.profile = p
+        return self.profile
+
+    def _pick(self):
+        eng = self.win.settings.get("engine")
+        if eng not in ENGINES:
+            eng = "Google"
+        for _ in range(8):
+            if random.random() < 0.6:
+                key = make_noise_query()
+                url = QUrl(search_url(eng, key))
+                parts = urlparse(ENGINES[eng]).netloc.split(".")
+                self._expect = parts[-2] if len(parts) >= 2 else None
+            else:
+                key = random.choice(NOISE_SITES)
+                url = QUrl(key)
+                self._expect = None
+            if key not in self.recent:
+                break
+        self.recent = (self.recent + [key])[-40:]
+        return url
+
+    def fire(self):
+        if PRIVATE or not self.win.settings.get("history_noise"):
+            return
+        if self.page is not None:   # the last one is somehow still going
+            self.schedule()
+            return
+        url = self._pick()
+        page = NoisePage(self._profile(), self)
+        self.page = page
+        page.loadFinished.connect(lambda ok, p=page: self._loaded(p, ok))
+        self.guard.start(30000)
+        page.load(url)
+
+    def _loaded(self, page, ok):
+        if page is not self.page:
+            return
+        self.guard.stop()
+        u = page.url()
+        good = ok and u.scheme() in ("http", "https") and bool(u.host())
+        if good and self._expect:   # a search: only count a real results page (not a consent wall or a 'sorry' page)
+            good = self._expect in u.host() and "/sorry" not in u.path()
+        if good:
+            self.win.add_noise_history(u.toString(), page.title() or u.host())
+        QTimer.singleShot(random.randint(4000, 11000), lambda p=page: self._finish(p))
+        self.schedule()
+
+    def _finish(self, page):
+        if page is self.page:
+            self._drop()
+
+    def _give_up(self):
+        self._drop()
+        if self.win.settings.get("history_noise"):
+            self.schedule()
+
+    def _drop(self):
+        p, self.page = self.page, None
+        if p is not None:
+            try:
+                p.triggerAction(QWebEnginePage.WebAction.Stop)
+            except RuntimeError:
+                pass
+            p.deleteLater()
 
 
 class Browser(QMainWindow):
@@ -18428,6 +19840,7 @@ class Browser(QMainWindow):
         self.resize(1280, 820)
         DATA_DIR.mkdir(exist_ok=True)
         self.settings = jload("settings.json", {"engine": "Google"})
+        load_custom_engine(self.settings)  # the search engine you added yourself, if any
         UI["mode"] = valid_ui_mode(self.settings.get("ui_style"))
         load_ui_tuning(self.settings)
         TERM["on"] = bool(self.settings.get("private_terminal", True))
@@ -18480,12 +19893,22 @@ class Browser(QMainWindow):
         self.profile.setHttpCacheMaximumSize(SPEED_MODES[self.speed_mode]["cache_mb"] * 1024 * 1024)
         if PRIVATE:
             self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
-            if hasattr(self.profile, "setPersistentPermissionsPolicy"):  # Qt 6.8+: site permissions are forgotten too
-                self.profile.setPersistentPermissionsPolicy(QWebEngineProfile.PersistentPermissionsPolicy.StoreInMemory)
         else:
             self.profile.setCachePath(str(DATA_DIR / "cache"))
             self.profile.setPersistentCookiesPolicy(
                 QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
+        # Fjord keeps its own per-site answers (settings.json, never written in private windows). Qt must therefore ask every time:
+        # otherwise "Allow once" would be remembered by Qt for good and "Block" could never be undone from Fjord's own list.
+        if hasattr(self.profile, "setPersistentPermissionsPolicy") and hasattr(QWebEngineProfile, "PersistentPermissionsPolicy"):
+            try:
+                self.profile.setPersistentPermissionsPolicy(QWebEngineProfile.PersistentPermissionsPolicy.AskEveryTime)
+            except Exception:
+                pass
+        try:  # sites that were granted notifications need something to show them
+            self.profile.setNotificationPresenter(self.show_web_notification)
+        except Exception:
+            pass
+        self._web_notes = []
         self.profile.downloadRequested.connect(self.on_download)
         hook = QWebEngineScript()  # lets the sidebar media player trigger next/previous track
         hook.setName("fjord-media-hook")
@@ -18568,6 +19991,9 @@ class Browser(QMainWindow):
         self._ab_timer = QTimer(self)  # long-running sessions: look for fresh filter lists every 6 hours (cheap when nothing changed)
         self._ab_timer.timeout.connect(lambda: self.adblock.load_async())
         self._ab_timer.start(6 * 3600 * 1000)
+        self.noise = HistoryNoise(self)  # the history randomiser (idle unless switched on)
+        if self.settings.get("history_noise") and not PRIVATE:
+            self.noise.start()
         self.icons = IconFetcher()
         self.icons.ready.connect(self.on_icons_ready)
         if not PRIVATE:
@@ -18592,7 +20018,8 @@ class Browser(QMainWindow):
 
     @property
     def engine(self):
-        return self.settings.get("engine", "Google")
+        e = self.settings.get("engine", "Google")
+        return e if e in ENGINES else "Google"
 
     # ----- UI -----
     def _build_ui(self):
@@ -18687,14 +20114,17 @@ class Browser(QMainWindow):
         self.completer.activated[str].connect(
             lambda t: (self.addr.setText(t), QTimer.singleShot(0, self.navigate)))
         self.addr.setCompleter(self.completer)
-        self.btn_engine = self._tool("Google ▾", self.show_engine_menu)
+        self.btn_engine = EngineButton()   # click: the engine popup · roll the wheel over it: switch engine
         self.btn_engine.setObjectName("engine")
         self.btn_engine.setFixedSize(ToolIcon.SIZE, ToolIcon.SIZE)
+        self.btn_engine.clicked.connect(self.show_engine_menu)
+        self.btn_engine.stepped.connect(self.cycle_engine)
         self.btn_speed = ToolIcon("speed", "", self.show_speed_menu)
         self.update_speed_btn()
         self.btn_vpn = ToolIcon("shield", "Privacy dashboard", self.show_privacy_dashboard)
         self.btn_ext = ToolIcon("puzzle", "Extensions", self.show_ext_menu)
         self.btn_star = ToolIcon("star", "Bookmark this page  (Ctrl+D)", self.toggle_bookmark)
+        self.btn_site = ToolIcon("sliders", "Site settings", self.show_site_settings)
         self.btn_style = ToolIcon("ui_default", "", self.show_style_menu)  # optional small indicator: add it via Customize toolbar
         self.btn_style.setFixedSize(30, 30)
         self.update_style_btn()
@@ -19166,7 +20596,7 @@ class Browser(QMainWindow):
             "shortcuts": lambda: self.open_shortcuts(),
             "zoom_in": lambda: self.zoom(0.1),
             "zoom_out": lambda: self.zoom(-0.1),
-            "zoom_reset": lambda: self.cur().setZoomFactor(1.0),
+            "zoom_reset": lambda: self.zoom_reset(),
             "copy_url": copy_url,
             "scroll_top": lambda: scroll("window.scrollTo({top:0,behavior:'smooth'})"),
             "scroll_bottom": lambda: scroll("window.scrollTo({top:document.documentElement.scrollHeight,behavior:'smooth'})"),
@@ -19236,6 +20666,8 @@ class Browser(QMainWindow):
         tab.urlChanged.connect(lambda _u, t=tab: self.apply_internal_icon(t))
         tab.loadFinished.connect(lambda _ok, t=tab: self.apply_internal_icon(t))
         tab.urlChanged.connect(lambda _u, t=tab: self.sync_chrome(t))
+        tab.urlChanged.connect(lambda _u, t=tab: self.apply_site_zoom(t))
+        tab.loadFinished.connect(lambda _ok, t=tab: self.apply_site_zoom(t))
         tab.loadStarted.connect(lambda t=tab: self.set_loading(t, True))
         tab.loadFinished.connect(lambda ok, t=tab: self.on_loaded(t, ok))
         tab.loadFinished.connect(lambda _ok, t=tab: t.reapply_volume())
@@ -19647,7 +21079,7 @@ class Browser(QMainWindow):
             us = u.toString()
             if not (self.history and self.history[-1]["url"] == us):
                 self.history.append({"url": us, "title": tab.title(), "t": time.time()})
-                del self.history[:-3000]
+                self.trim_history()
                 jsave("history.json", self.history)
                 self.refresh_completer()
 
@@ -19725,7 +21157,19 @@ class Browser(QMainWindow):
 
     def zoom(self, d):
         t = self.cur()
-        t.setZoomFactor(max(0.25, min(5.0, t.zoomFactor() + d)))
+        self.set_zoom(t, t.zoomFactor() + d)
+
+    def zoom_reset(self):
+        self.set_zoom(self.cur(), 1.0)
+
+    def set_zoom(self, t, z):
+        """Zoom a tab, and remember the level for its website (100% forgets it)."""
+        z = round(max(0.25, min(5.0, z)), 2)
+        t.setZoomFactor(z)
+        host = self.site_host(t.url())
+        if host:
+            t._site_zoomed = abs(z - 1.0) >= 0.005
+            self.site_set(host, "zoom", z if t._site_zoomed else None)
 
     def extent(self):
         return self.h_tab_w if self.horiz else 40
@@ -20080,6 +21524,13 @@ class Browser(QMainWindow):
             self.set_adblock(v == "1")
         elif k == "vpn":
             self.toggle_vpn()
+        elif k == "history_noise":
+            self.set_history_noise(v == "1", refresh=False)  # the settings page is redrawn below
+        elif k == "history_noise_rate" and v in NOISE_RATES:
+            st[k] = v
+            self.noise.reschedule()
+        elif k == "history_noise_clear":
+            self.clear_noise_history()
         elif k == "preset" and v in ("tor", "local"):
             st.update(proxy_type="socks5", proxy_host="127.0.0.1", proxy_port="9050" if v == "tor" else "1080",
                       proxy_user="", proxy_pw="")
@@ -20099,6 +21550,8 @@ class Browser(QMainWindow):
             self.set_speed_mode(v)
         elif k == "scratch_popup":
             self.set_scratch_popup(v == "1")
+        elif k == "scratch_clipboard":
+            self.set_scratch_clipboard(v == "1")
         elif k == "auto_update":
             self.set_auto_update(v == "1")
         elif k == "check_update":
@@ -20224,6 +21677,8 @@ class Browser(QMainWindow):
             except RuntimeError:
                 pass
         self.chips = {}
+        if not hasattr(self, "_chip_seen"):
+            self._chip_seen, self._chips_primed = set(), False
         sb = self.search_btn
         if sb.parentWidget() is not None and sb.parentWidget().parentWidget() is self.group_wrap:
             sb.setParent(self.side)  # it sits in the old group row, which is about to be deleted
@@ -20256,6 +21711,10 @@ class Browser(QMainWindow):
             chip.clicked.connect(lambda g=g: self.toggle_group(g))
             chip.customContextMenuRequested.connect(lambda _p, g=g: self.group_menu(g))
             self.chips[g["id"]] = chip
+            if g["id"] not in self._chip_seen:  # a group that did not exist a moment ago pops in
+                self._chip_seen.add(g["id"])
+                if self._chips_primed:
+                    chip.intro()
             if n == 0:  # empty island: its header lives up in the group bar until a tab joins
                 if self.horiz:
                     chip.setFixedWidth(self.island_hdr())
@@ -20291,6 +21750,7 @@ class Browser(QMainWindow):
         if not self.horiz:
             sb.show()
         self.group_lay.addWidget(row)
+        self._chips_primed = True
         self.refresh_group_rows()
         self.queue_save()
 
@@ -20370,10 +21830,10 @@ class Browser(QMainWindow):
             self.layout_islands()
             return
         anim = QVariantAnimation(self)
-        anim.setDuration(max(90, int(240 * abs(target - was))))
+        anim.setDuration(max(110, int(GROUP_MS.get(style_key(), 320) * abs(target - was))))
         anim.setStartValue(was)
         anim.setEndValue(target)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setEasingCurve(group_curve())
         self.ganim[gid] = anim
         self.gprog[gid] = was
 
@@ -20400,8 +21860,9 @@ class Browser(QMainWindow):
         name, ok = QInputDialog.getText(self, "New group", "Group name:", text="Group %d" % (len(self.groups) + 1))
         if not ok or not name.strip():
             return
+        pal = group_palette()
         g = {"id": "g%d" % int(time.time() * 1000), "name": name.strip()[:24],
-             "color": GROUP_COLORS[len(self.groups) % len(GROUP_COLORS)][1], "collapsed": False}
+             "color": pal[len(self.groups) % len(pal)][1], "collapsed": False}
         self.groups.append(g)
         if tab is not None and not tab.closing:
             self.add_to_group(tab, g["id"])
@@ -20462,8 +21923,8 @@ class Browser(QMainWindow):
         m.addAction("Expand" if g["collapsed"] else "Collapse", lambda: self.toggle_group(g))
         m.addAction("Rename…", lambda: self.rename_group(g))
         cm = m.addMenu("Color")
-        for name, col in GROUP_COLORS:
-            a = cm.addAction(name)
+        for name, col in group_palette():
+            a = cm.addAction(swatch_icon(col), name)
             a.triggered.connect(lambda _c=False, col=col: self.set_group_color(g, col))
         m.addSeparator()
         m.addAction("Ungroup", lambda: self.delete_group(g, False))
@@ -20620,6 +22081,49 @@ class Browser(QMainWindow):
         self.refresh_adblock_pages()
         self.toast("Ad blocking " + ("on" if on else "off"), 2500)
         self._reload_if_site()
+
+    # ----- history randomiser -----
+    def set_history_noise(self, on, refresh=True):
+        if PRIVATE:
+            self.toast("The history randomiser isn't available in a private window (nothing is saved there)", 4000)
+            return
+        on = bool(on)
+        self.settings["history_noise"] = on
+        jsave("settings.json", self.settings)
+        if on:
+            self.noise.start()
+        else:
+            self.noise.stop()
+        self.toast("History randomiser " + ("on" if on else "off"), 2500)
+        t = self.cur()
+        if refresh and t is not None and t.url().scheme() == "fjord" and t.url().host() == "settings":
+            QTimer.singleShot(0, lambda: self.open_settings(keep_scroll=True))
+
+    def add_noise_history(self, url, title):
+        """One visit made by the randomiser. Tagged ("n") so it can be capped and cleared without touching real history."""
+        if PRIVATE or (self.history and self.history[-1]["url"] == url):
+            return
+        self.history.append({"url": url, "title": title, "t": time.time(), "n": 1})
+        self.trim_history()
+        jsave("history.json", self.history)
+
+    def trim_history(self):
+        """Keep at most 3000 entries. The randomiser's own are capped separately (oldest first) so they never push real visits out."""
+        noisy = [i for i, h in enumerate(self.history) if h.get("n")]
+        if len(noisy) > NOISE_KEEP:
+            drop = set(noisy[:len(noisy) - NOISE_KEEP])
+            self.history = [h for i, h in enumerate(self.history) if i not in drop]
+        del self.history[:-3000]
+
+    def noise_count(self):
+        return sum(1 for h in self.history if h.get("n"))
+
+    def clear_noise_history(self):
+        n = self.noise_count()
+        self.history = [h for h in self.history if not h.get("n")]
+        jsave("history.json", self.history)
+        self.refresh_completer()
+        self.toast("Removed %d generated entr%s" % (n, "y" if n == 1 else "ies") if n else "No generated entries to remove", 3000)
 
     def pause_site(self, host, pause):
         if not host:
@@ -20842,7 +22346,8 @@ class Browser(QMainWindow):
     def refresh_completer(self):
         urls = [b["url"] for b in self.bookmarks]
         seen = set(urls)
-        for h in reversed(self.history[-600:]):
+        real = [h for h in self.history if not h.get("n")]  # the randomiser's entries stay out of the address bar's suggestions
+        for h in reversed(real[-600:]):
             if h["url"] not in seen:
                 seen.add(h["url"])
                 urls.append(h["url"])
@@ -21090,6 +22595,7 @@ class Browser(QMainWindow):
             if not v.locked:
                 m = next((en for en in v.entries if en["id"] == g("id")), None)
                 if m:
+                    self.scratch.mute_clip(35)   # never keep a copied password in the Scratchpad
                     QApplication.clipboard().setText(m["password"])
                     self.toast("Password copied \u2014 clears in 30s", 3000)
                     QTimer.singleShot(30000, lambda pw=m["password"]: self._clear_clip(pw))
@@ -21108,9 +22614,23 @@ class Browser(QMainWindow):
     def _clear_clip(self, expected):
         cb = QApplication.clipboard()
         if cb.text() == expected:
+            self.scratch.mute_clip()
             cb.clear()
 
-    # ----- site permissions (camera, microphone) -----
+    # ----- site permissions (camera, microphone, location, notifications, clipboard...) -----
+    def show_web_notification(self, note):
+        """A site the person allowed notifications for wants to show one: it appears in Fjord's own toast."""
+        try:
+            self._web_notes.append(note)
+            note.closed.connect(lambda n=note: self._web_notes.remove(n) if n in self._web_notes else None)
+            note.show()
+            title = (note.title() or note.origin().host() or "").strip()
+            body = (note.message() or "").strip()
+            text = ("%s: %s" % (title, body)) if body else title
+            self.toast(text[:160] + ("\u2026" if len(text) > 160 else ""), 7000)
+        except Exception:
+            pass
+
     def place_bars(self):
         """Stack the prompt bars in the top-right corner: permission first, then save-password, then default-browser."""
         for name in ("_perm_bar", "_save_bar", "_default_bar"):
@@ -21158,6 +22678,7 @@ class Browser(QMainWindow):
                 self._perm_bar.show()
                 self._perm_bar.raise_()
                 self.place_bars()
+                self._perm_bar.animate_in()
                 return
 
     def perm_sync(self):
@@ -21215,6 +22736,139 @@ class Browser(QMainWindow):
         except Exception:
             pass
         self.toast("Site permissions reset" if n else "No saved site permissions", 3000)
+
+    # ----- per-site settings (JavaScript, images, zoom) -----
+    # Stored in settings.json as {"site_settings": {"example.com": {"js": False, "images": False, "zoom": 1.25}}}.
+    # A missing key means "use the default".
+    def site_host(self, u):
+        """The key a URL's settings are filed under; "" for Fjord's own pages and anything that is not a website."""
+        try:
+            if not isinstance(u, QUrl):
+                u = QUrl(u)
+            if u.scheme() not in ("http", "https"):
+                return ""
+            return self.host_of(u).lower()
+        except Exception:
+            return ""
+
+    def site_cfg(self, host):
+        ss = self.settings.get("site_settings")
+        c = ss.get(host) if isinstance(ss, dict) and host else None
+        return c if isinstance(c, dict) else {}
+
+    def site_set(self, host, key, value):
+        """Remember one setting for a site; None forgets it again (back to the default)."""
+        if not host:
+            return
+        ss = self.settings.get("site_settings")
+        if not isinstance(ss, dict):
+            ss = self.settings["site_settings"] = {}
+        c = ss.setdefault(host, {})
+        if value is None:
+            c.pop(key, None)
+        else:
+            c[key] = value
+        if not c:
+            ss.pop(host, None)
+        jsave("settings.json", self.settings)
+
+    def apply_site_settings(self, page, url):
+        """Give a page the JavaScript / image settings of the site it is about to show."""
+        try:
+            host = self.site_host(url)
+            cfg = self.site_cfg(host)
+            A = QWebEngineSettings.WebAttribute
+            s = page.settings()
+            for attr, key in ((A.JavascriptEnabled, "js"), (A.AutoLoadImages, "images")):
+                v = cfg.get(key)
+                if isinstance(v, bool):
+                    s.setAttribute(attr, v)
+                else:
+                    s.resetAttribute(attr)  # back to the profile's default
+        except RuntimeError:
+            pass
+
+    def apply_site_zoom(self, tab):
+        try:
+            z = self.site_cfg(self.site_host(tab.url())).get("zoom")
+            if isinstance(z, (int, float)) and not isinstance(z, bool) and 0.25 <= z <= 5.0:
+                if abs(tab.zoomFactor() - z) > 0.001:
+                    tab.setZoomFactor(float(z))
+                tab._site_zoomed = True
+            elif getattr(tab, "_site_zoomed", False):  # leaving a site that had its own zoom
+                tab.setZoomFactor(1.0)
+                tab._site_zoomed = False
+        except RuntimeError:
+            pass
+
+    def site_refresh_tabs(self, host):
+        """Re-apply a site's settings to every open tab showing it."""
+        for i in range(self.stack.count()):
+            t = self.stack.widget(i)
+            if self.site_host(t.url()) == host:
+                self.apply_site_settings(t.page(), t.url())
+                self.apply_site_zoom(t)
+
+    def set_site_flag(self, host, key, on):
+        """JavaScript ("js") and images ("images") are on by default, so only turning them off is remembered."""
+        self.site_set(host, key, None if on else False)
+        self.site_refresh_tabs(host)
+        self._reload_if_site()
+
+    def show_site_settings(self):
+        if SiteSettings.recently_closed(self):
+            return
+        dlg = SiteSettings(self)
+        anchor = self.btn_site if self.btn_site.isVisible() else self.btn_menu
+        dlg.show_under(anchor)
+
+    def site_perm_entries(self, host):
+        """Saved camera/microphone answers for a site: [(settings key, part, "allow"/"deny")]."""
+        out = []
+        sp = self.settings.get("site_perms")
+        if isinstance(sp, dict):
+            for key, entry in sp.items():
+                h = (urlparse(key).hostname or "").lower()
+                h = h[4:] if h.startswith("www.") else h
+                if h == host and isinstance(entry, dict):
+                    out += [(key, part, v) for part, v in entry.items()]
+        return out
+
+    def site_perm_reset(self, host, save=True):
+        sp = self.settings.get("site_perms")
+        if isinstance(sp, dict):
+            for key, _part, _v in self.site_perm_entries(host):
+                sp.pop(key, None)
+        if save:
+            jsave("settings.json", self.settings)
+        try:  # Qt 6.8+ keeps its own copy of grants and blocks
+            if hasattr(self.profile, "listAllPermissions"):
+                for perm in self.profile.listAllPermissions():
+                    h = perm.origin().host().lower()
+                    if (h[4:] if h.startswith("www.") else h) == host:
+                        perm.reset()
+        except Exception:
+            pass
+
+    def site_reset(self, host):
+        """Forget everything Fjord remembers about one site's settings."""
+        if not host:
+            return
+        ss = self.settings.get("site_settings")
+        if isinstance(ss, dict):
+            ss.pop(host, None)
+        self.site_perm_reset(host, save=False)
+        jsave("settings.json", self.settings)
+        for i in range(self.stack.count()):
+            t = self.stack.widget(i)
+            if self.site_host(t.url()) == host:
+                self.apply_site_settings(t.page(), t.url())
+                self.apply_site_zoom(t)
+        if host in self.adblock.allow:
+            self.pause_site(host, False)  # also reloads the page
+        else:
+            self._reload_if_site()
+        self.toast("Settings for %s reset" % host, 3000)
 
     def offer_save_password(self, payload, host):
         if PRIVATE or not CRYPTO_OK:
@@ -21453,23 +23107,83 @@ class Browser(QMainWindow):
             self.extensions.add_path(path)
 
     # ----- menu -----
-    def set_engine(self, name):
+    def set_engine(self, name, direction=None):
+        """Switch search engine. direction (+1 / -1) is which way the toolbar logo spins; left out, it is worked out from the list order."""
+        if name not in ENGINES:
+            return
+        if direction is None:
+            names, old = list(ENGINES), self.engine
+            direction = 0 if (old == name or old not in names) else (1 if names.index(name) > names.index(old) else -1)
         self.settings["engine"] = name
         jsave("settings.json", self.settings)
-        self.update_engine_btn()
+        self.update_engine_btn(direction)
+        self.toast(f"Search engine: {name}", 2500)
+        timer = getattr(self, "_engine_settle", None)
+        if timer is None:  # the page work waits until you stop scrolling through the engines
+            timer = self._engine_settle = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._engine_settled)
+        timer.start(450 if direction else 0)
+
+    def _engine_settled(self):
         for i in range(self.stack.count()):
             t = self.stack.widget(i)
             if t.url().scheme() == "fjord" and t.url().host() == "start":
                 t.setHtml(self.start_page(), START_URL)
         self.rerun_search()
-        self.toast(f"Search engine: {name}", 2500)
+
+    def cycle_engine(self, step):
+        """Mouse wheel over the engine button: next (+1) or previous (-1) engine, wrapping round."""
+        names = list(ENGINES)
+        if not names:
+            return
+        cur = self.engine
+        i = names.index(cur) if cur in names else 0
+        self.set_engine(names[(i + step) % len(names)], 1 if step > 0 else -1)
+
+    def set_custom_engine(self, raw):
+        """From the popup's own-engine box. Returns (True, name) or (False, reason)."""
+        name, tpl = clean_engine_template(raw)
+        if name is None:
+            return False, tpl
+        register_custom_engine(name, tpl)
+        self.settings["custom_engine"] = {"name": name, "url": tpl}
+        if not PRIVATE:
+            self.icons.fetch()  # fetch its real logo (a lettered disc shows until it arrives)
+        self.set_engine(name, 1)
+        self._refresh_settings_page()
+        return True, name
+
+    def remove_custom_engine(self):
+        name = CUSTOM_ENGINE.get("name")
+        if not name:
+            return
+        was_current = self.engine == name
+        unregister_custom_engine()
+        self.settings.pop("custom_engine", None)
+        if was_current:
+            self.set_engine("Google")  # also saves the settings
+        else:
+            jsave("settings.json", self.settings)
+            self.update_engine_btn()
+        self.toast("Removed " + name, 2500)
+        self._refresh_settings_page()
+
+    def _refresh_settings_page(self):
+        t = self.cur()
+        if t is not None and t.url().scheme() == "fjord" and t.url().host() == "settings":
+            self.open_settings(keep_scroll=True)
 
     def rerun_search(self):
         t = self.cur()
         u = t.url()
-        q = parse_qs(u.query()).get("q", [""])[0]
-        on_engine = any(u.host() == QUrl(b).host() for b in ENGINES.values())
-        if q and on_engine and u.host() != QUrl(ENGINES[self.engine]).host():
+        q = ""
+        for n, b in ENGINES.items():  # which engine's results page is this, and what was searched for?
+            if u.host() == QUrl(b).host():
+                q = parse_qs(u.query()).get(engine_param(n), [""])[0]
+                if q:
+                    break
+        if q and u.host() != QUrl(ENGINES[self.engine]).host():
             t.load(to_url(q, self.engine))
 
     def set_private_terminal(self, on):
@@ -21518,22 +23232,15 @@ class Browser(QMainWindow):
             if t.url().scheme() == "fjord" and t.url().host() == "start":
                 t.setHtml(self.start_page(), START_URL)
 
-    def update_engine_btn(self):
-        self.btn_engine.setIcon(engine_icon(self.engine))
-        self.btn_engine.setIconSize(QSize(ToolIcon.GLYPH + 2, ToolIcon.GLYPH + 2))
-        self.btn_engine.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.btn_engine.setText("")
-        self.btn_engine.setToolTip(f"Search engine: {self.engine}")
+    def update_engine_btn(self, direction=0):
+        self.btn_engine.show_engine(self.engine, direction)
+        self.btn_engine.setToolTip(f"Search engine: {self.engine}  (click for more, scroll to switch)")
         self.addr.setPlaceholderText(term_prompt() + "  search or enter address" if term_on() else f"Search {self.engine} or enter address")
 
     def show_engine_menu(self):
-        m = QMenu(self)
-        for name in ENGINES:
-            a = m.addAction(engine_icon(name), name)
-            a.setCheckable(True)
-            a.setChecked(name == self.engine)
-            a.triggered.connect(lambda _c, n=name: self.set_engine(n))
-        m.exec(self.btn_engine.mapToGlobal(self.btn_engine.rect().bottomLeft()))
+        if EnginePopup.recently_closed(self):
+            return  # the click that closed the popup shouldn't reopen it
+        EnginePopup(self).show_under(self.btn_engine)
 
     # ----- frequently visited sites (new tab page) -----
     @staticmethod
@@ -22012,6 +23719,11 @@ class Browser(QMainWindow):
         jsave("settings.json", self.settings)
         self.toast("Scratchpad %s when you drag something" % ("pops up" if on else "stays put"), 2500)
 
+    def set_scratch_clipboard(self, on):
+        self.settings["scratch_clipboard"] = bool(on)
+        jsave("settings.json", self.settings)
+        self.toast("Copied things %s the Scratchpad" % ("now go to" if on else "no longer go to"), 2500)
+
     def on_update_uptodate(self):
         self._update_busy = False
         if self._update_manual:
@@ -22271,7 +23983,8 @@ class Browser(QMainWindow):
         view = m.addMenu("View && appearance")
         view.addAction("Zoom in", lambda: self.zoom(0.1))
         view.addAction("Zoom out", lambda: self.zoom(-0.1))
-        view.addAction("Reset zoom", lambda: self.cur().setZoomFactor(1.0))
+        view.addAction("Reset zoom", self.zoom_reset)
+        view.addAction("Site settings…", self.show_site_settings)
         view.addAction("Fullscreen\tF11", self.toggle_fullscreen)
         fkeys = self.key_map().get("focus_mode") or []
         view.addAction("Focus mode" + ("\t" + native_key(fkeys[0]) if fkeys else ""), self.toggle_focus_mode)
@@ -22292,6 +24005,10 @@ class Browser(QMainWindow):
         sp.setCheckable(True)
         sp.setChecked(bool(self.settings.get("scratch_popup", True)))
         sp.triggered.connect(lambda _c: self.set_scratch_popup(not self.settings.get("scratch_popup", True)))
+        sc = view.addAction("Add copied things to Scratchpad")
+        sc.setCheckable(True)
+        sc.setChecked(bool(self.settings.get("scratch_clipboard", True)))
+        sc.triggered.connect(lambda _c: self.set_scratch_clipboard(not self.settings.get("scratch_clipboard", True)))
         view.addMenu(self.style_menu(view))
         view.addMenu(self.winbtn_menu(view))
         view.addAction("Customize toolbar…", self.tb_ed.start)
@@ -22307,6 +24024,11 @@ class Browser(QMainWindow):
             paused = site in self.adblock.allow
             priv.addAction(("Resume" if paused else "Pause") + " ad blocking on " + site,
                            lambda: self.pause_site(site, not paused))
+        hn = priv.addAction("History randomiser")
+        hn.setCheckable(True)
+        hn.setChecked(bool(self.settings.get("history_noise")) and not PRIVATE)
+        hn.setEnabled(not PRIVATE)
+        hn.triggered.connect(lambda _c: self.set_history_noise(not self.settings.get("history_noise", False)))
         sl = priv.addAction("Sleep background tabs (saves memory)")
         sl.setCheckable(True)
         sl.setChecked(bool(self.settings.get("sleep_tabs", True)))
@@ -22395,6 +24117,10 @@ class Browser(QMainWindow):
         if f is not None:
             f.hide()
         self.budget_save()
+        try:
+            self.noise.stop()
+        except Exception:
+            log_error("history randomiser stop")
         try:
             self.chat.hub.shutdown()
         except Exception:
