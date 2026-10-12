@@ -42,7 +42,7 @@ Ctrl+K (or the magnifier next to the Scratchpad) opens one box for your open tab
 **Chat**
 Ctrl+Shift+M (or the speech bubble beside the Scratchpad) lets you talk to other Fjord users on the same network. There's no server. Fjord finds people on your Wi-Fi or LAN by itself, or you can connect by address. You can send messages, reactions, files up to 100 MB, the page you're on, or Scratchpad items, and each chat has a shared pinboard. Set a room code to only see people with the same code. With `cryptography` installed, a room code also encrypts the messages.
 
-Chat is local-network only and uses ports 47820 (UDP) and 47821 (TCP), so Windows may ask about the firewall the first time. Without a room code and `cryptography`, messages aren't encrypted, so don't send anything sensitive that way.
+Chat is local-network only and uses ports 47820 (UDP) and 47821 (TCP), so Windows may ask about the firewall the first time. If nobody shows up, check that both computers are on the same Wi-Fi (guest and school networks often block it), use the same room code, and allow Fjord through the firewall on private networks. Without a room code and `cryptography`, messages aren't encrypted, so don't send anything sensitive that way.
 
 **Picture in picture**
 Click the media player in the sidebar to pop a video out into a small floating window. Drag it anywhere and it glides to the nearest corner, pull a corner to resize it, click to pause, and double-click to send it back to its tab. It can also pop out by itself when you scroll a playing video out of view.
@@ -56,8 +56,17 @@ The shield button shows how many ads and trackers were blocked on the site you'r
 **Blocking ads and trackers**
 Fjord has its own filter engine that reads uBlock Origin / EasyList style lists (uBlock filters, EasyList, EasyPrivacy, a malware list and a few others). It's on by default. It handles scriptlets and procedural hiding rules, along with `$important`, `$badfilter` and `$document` filters, blocks known malware pages, and refreshes the lists on its own. You can pause it per site. It isn't uBlock Origin itself, so it won't catch every last thing it does, but it handles most of it, and YouTube gets some extra handling.
 
-**Camera and microphone**
-When a site asks, a bar slides in with Block, Allow once and Allow. Block and Allow are remembered per site. Forget them from ⋯ > Privacy > Reset saved site permissions.
+**Site permissions**
+When a site wants your camera, microphone, location, notifications, clipboard, pointer lock or local fonts, a bar slides in with Block, Allow once and Allow. Block and Allow are remembered per site, and you can change them later in Site settings. Forget them all from ⋯ > Privacy > Reset saved site permissions. Notifications from sites you allow show up as a Fjord toast.
+
+**Site settings**
+The sliders button next to the bookmark star (or ⋯ > View & appearance > Site settings…) shows what Fjord remembers for the site you're on: JavaScript on or off, pictures on or off, ad blocking, zoom and saved permission answers. Each one applies to that site only, and Reset this site puts it all back. Zoom is remembered per site too.
+
+**Search engines**
+The engine button shows the logo of your current engine. Roll the mouse wheel over it to switch engines (the logo spins to the next one), or click it for the full list. You can add one engine of your own: paste its search address with `%s` where the search words go, like `https://example.com/search?q=%s`.
+
+**History randomiser**
+Off by default. When it's on, Fjord now and then runs one ordinary search or opens one well-known site in an invisible, muted page and adds it to your history, so your real browsing sits among everyday noise. It only uses built-in lists, never follows links or results, never touches your tabs, and keeps no cookies or sign-ins from those visits. You pick how often (light, normal, heavy) and can remove everything it generated in one click. It only changes Fjord's own history. It doesn't hide you from websites or your internet provider, and it isn't anonymity. Not available in private windows. Find it in Settings > Search & privacy.
 
 **Passwords**
 Fjord can save your logins behind one master password. They're encrypted on your computer and never sent anywhere. After you sign in somewhere new it offers to save the login, and Ctrl+Shift+L fills a saved password for the site you're on. You can add logins by hand, copy or edit them from ⋯ > Passwords, and import a CSV exported from another browser.
@@ -89,11 +98,11 @@ Right-click the toolbar and pick Customize. Drag buttons to rearrange them, drag
 
 **Sidebar extras**
 - A media player that shows up when a page is playing audio or video. It has a seek bar and a visualiser (bars, mirror, wave or dots), and it picks up colours from the album art.
-- Scratchpad (Ctrl+Shift+S): drag images, files, text or links toward the window and it pops open to catch them. Things stay there until you need them again. If the pop-up gets in your way, turn it off in the ⋯ menu.
+- Scratchpad (Ctrl+Shift+S): drag images, files, text or links toward the window and it pops open to catch them. Anything you copy with Ctrl+C is added too (copied passwords are never kept). Things stay there until you need them again. If the pop-up or the copy capture gets in your way, turn them off in the ⋯ menu or settings.
 - Sticky notes: there's a small note button in the bottom right of every site. Notes are saved per site and are still there next time. You can hide the button in settings.
 
 **Looks**
-- Three interface styles: Default, macOS (frosted glass, smooth motion, Mac window buttons) and Windows (a Windows 11 look and Windows buttons). Switch in settings or from the ⋯ menu.
+- Three interface styles: Default, macOS (frosted glass, smooth motion, Mac window buttons) and Windows (a Windows 11 look and Windows buttons). Switch in settings or from the ⋯ menu. Tab groups, prompts and animations follow whichever style you're in.
 - Two sliders for how bright and how transparent the glass surfaces are.
 - New tab page with a custom greeting and a background of your choice: a colour, a gradient, an image, or a video.
 - Pick any accent colour, greys included, plus a font, in settings.
@@ -179,7 +188,7 @@ For self-update to work, attach the exe to your GitHub release and make sure its
 
 ## Known rough edges
 
-- It's a beta. Chat, picture in picture and the command palette are the newest parts and the most likely to have rough spots.
+- It's a beta. Chat, picture in picture, the command palette and site settings are the newest parts and the most likely to have rough spots.
 - It's built and tested mostly on Windows. Linux and macOS should work but get less attention.
 - Chat only works on a local network, and isn't encrypted without a room code and `cryptography`.
 - Self-update only works for the Windows exe, or when running `fjord.py` directly.
