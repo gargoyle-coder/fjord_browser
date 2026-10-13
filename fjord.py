@@ -4,6 +4,7 @@ Fjord Browser - a minimalist, dark, Nordic-inspired browser.
 
 Install:  pip install PyQt6 PyQt6-WebEngine      (6.10+ for browser extensions)
           pip install cryptography               (optional, enables saved passwords)
+          pip install "yt-dlp[default]"           (optional, enables YouTube downloads; Fjord can install it for you)
 Run:      python fjord.py [url ...]
           python fjord.py --private              (private window)
           python fjord.py --adblock-selftest     (ad blocker check)
@@ -59,6 +60,7 @@ Run:      python fjord.py [url ...]
 #   47  Chat: Widgets & Drawer
 #   48  Welcome Tour
 #   49  Download Shelf
+#   49b YouTube Video Downloader
 #   50  Notification Bars: Passwords, Default Browser, Permissions
 #   51  History Randomiser
 #   52  Main Browser Window
@@ -99,6 +101,7 @@ import threading
 import time
 import urllib.request
 import zipfile
+from itertools import chain as _chain
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -109,7 +112,7 @@ from urllib.parse import parse_qs, quote, quote_plus, unquote, urlparse
 # 02  APP INFO & OPTIONAL DEPENDENCIES
 # ====================================================================================================
 
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.5.2"
 GITHUB_REPO = "gargoyle-coder/fjord_browser"
 UPDATE_ASSET = "fjord.py"
 
@@ -191,9 +194,9 @@ try:
 except Exception:
     QSvgRenderer = None
 from PyQt6.QtWidgets import (
-    QApplication, QBoxLayout, QCompleter, QFileDialog, QKeySequenceEdit, QFrame, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QListView, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu as _QMenu, QInputDialog, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
-    QScrollArea, QStackedWidget, QStyle, QAbstractButton, QDialog, QColorDialog, QGraphicsEffect, QStyledItemDelegate, QStyleOptionViewItem, QToolButton, QVBoxLayout, QWidget,
+    QApplication, QBoxLayout, QCompleter, QFileDialog as _QFileDialog, QKeySequenceEdit, QFrame, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QListView, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu as _QMenu, QMessageBox as _QMessageBox, QProgressBar, QPushButton, QSizePolicy,
+    QScrollArea, QStackedWidget, QStyle, QAbstractButton, QDialog, QColorDialog as _QColorDialog, QGraphicsEffect, QStyledItemDelegate, QStyleOptionViewItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 
@@ -1427,7 +1430,7 @@ def settings_html(b):
         '<div class=row><div>%s<small>%s</small></div><a class=x href="fjord://ess-remove?h=%s">Remove</a></div>'
         % (e(x["title"]), e(x["host"]), quote(x["host"], safe="")) for x in b.essentials)
     if not ess:
-        ess = '<div class=hint style="padding-top:14px">No Essentials yet. Open a website in another tab, then pick it from the list below or right-click its tab and choose Add to Essentials.</div>'
+        ess = '<div class=hint style="padding-top:14px">No Essentials yet. Open a website in another tab, then pick it from the list below or right-click its tab and choose Add to Essentials. Each Essential keeps its own tab and remembers where you stopped browsing.</div>'
     have = {x["host"] for x in b.essentials}
     open_rows = ""
     for i in range(b.stack.count()):
@@ -1647,6 +1650,10 @@ def settings_html(b):
     glass_sec = "<h2>Glass</h2><div class=card>" + tune_rows + "</div>"
     ess_sec = ("<h2>Essentials</h2><div class=card>"
                + sw("ess_startup", "Keep Essentials loaded", "Open your Essentials in the background at startup so they are always ready", True)
+               + ('<div class=row><div>Rows<small>Spread your Essentials over several rows to make a grid above the tab bar</small></div>'
+                  + seg("ess_rows", [(n, str(n)) for n in range(1, 5)], b.ess_rows_setting()) + "</div>" if b.horiz else
+                  '<div class=row><div>Columns<small>How many Essentials sit side by side. The sidebar widens to fit them</small></div>'
+                  + seg("ess_cols", [(n, str(n)) for n in range(1, 5 if b.compact else 7)], b.ess_cols_setting()) + "</div>")
                + ess + "</div>")
     search_sec = "<h2>Search</h2><div class=card>" + engine_row + "</div>"
     palette_sec = ("<h2>Command palette</h2><div class=card>"
@@ -1784,15 +1791,22 @@ def settings_html(b):
                        + sw("default_ask", "Ask on launch", "Offer to make Fjord your default browser when it starts and isn't the default", True)
                        + "</div>")
 
-    cats = [("appearance", "Appearance", accent_sec + window_sec + glass_sec + font_sec),
-            ("tabs", "Tabs & sidebar", sidebar_sec + tabs_sec + ess_sec),
-            ("performance", "Speed & memory", perf_sec),
-            ("newtab", "New tab", greet_sec + bg_sec),
-            ("privacy", "Search & privacy", search_sec + privacy + noise_sec + vpn + private_sec),
-            ("features", "Features", focus_sec + palette_sec + notes_sec + scratch_sec),
-            ("controls", "Keyboard & mouse", keys_sec + mouse_sec),
-            ("extensions", "Extensions", ext_sec),
-            ("general", "General", default_sec + upd_sec + tour_sec)]
+    def flat(*secs):
+        """Join a category's blocks into one card: drop the sub-headings and merge the cards between them."""
+        out = "".join(secs)
+        out = re.sub(r"<h2>.*?</h2>", "", out)
+        out = re.sub(r"</div>(<div class=card[^>]*>)", "", out)
+        return out
+
+    cats = [("appearance", "Appearance", flat(accent_sec, window_sec, glass_sec, font_sec)),
+            ("tabs", "Tabs & sidebar", flat(sidebar_sec, tabs_sec, ess_sec)),
+            ("performance", "Speed & memory", flat(perf_sec)),
+            ("newtab", "New tab", flat(greet_sec, bg_sec)),
+            ("privacy", "Search & privacy", flat(search_sec, privacy, noise_sec, vpn, private_sec)),
+            ("features", "Features", flat(focus_sec, palette_sec, notes_sec, scratch_sec)),
+            ("controls", "Keyboard & mouse", flat(keys_sec, mouse_sec)),
+            ("extensions", "Extensions", flat(ext_sec)),
+            ("general", "General", flat(default_sec, upd_sec, tour_sec))]
     cat_icons = {
         "appearance": '<circle cx="8" cy="8" r="6"/><path d="M8 2a6 6 0 0 1 0 12z" fill="currentColor"/>',
         "tabs": '<rect x="2" y="3" width="12" height="10" rx="2"/><path d="M6 3v10"/>',
@@ -2099,8 +2113,13 @@ def popup_qss():
 # 15  MEMORY USAGE & PER-TAB RAM
 # ====================================================================================================
 
-def trim_memory():
-    """Collect garbage and hand freed heap pages back to the OS (Python's allocator otherwise keeps them)."""
+def trim_memory(deep=True):
+    """Collect garbage and hand freed heap pages back to the OS (Python's allocator otherwise keeps them).
+    deep=False is for when the person is using the browser: a full collection and especially the Windows working-set trim
+    make the next clicks stall while pages fault back in, so only the young generations are collected then."""
+    if not deep:
+        gc.collect(1)
+        return
     gc.collect()
     try:
         if sys.platform.startswith("linux"):
@@ -2116,16 +2135,38 @@ def trim_memory():
         pass
 
 
+_PSUTIL = [None]     # None = not tried yet, False = not installed
+_PS_PROCS = {}
+_WIN_PMC = []
+
+
+def _psutil():
+    if _PSUTIL[0] is None:
+        try:
+            import psutil
+            _PSUTIL[0] = psutil
+        except ImportError:
+            _PSUTIL[0] = False
+    return _PSUTIL[0]
+
+
 def process_rss_mb(pid):
     """Resident memory of a process in MB (None if it can't be read). Works with or without psutil."""
     if not pid or pid <= 0:
         return None
     try:
-        try:
-            import psutil
-            return psutil.Process(pid).memory_info().rss / 1048576.0
-        except ImportError:
-            pass
+        ps_mod = _psutil()
+        if ps_mod:
+            try:
+                pr = _PS_PROCS.get(pid)
+                if pr is None:
+                    if len(_PS_PROCS) > 64:
+                        _PS_PROCS.clear()
+                    pr = _PS_PROCS[pid] = ps_mod.Process(pid)
+                return pr.memory_info().rss / 1048576.0
+            except Exception:
+                _PS_PROCS.pop(pid, None)
+                return None
         if sys.platform.startswith("linux"):
             with open("/proc/%d/statm" % pid) as f:
                 return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576.0
@@ -2133,12 +2174,15 @@ def process_rss_mb(pid):
             import ctypes
             from ctypes import wintypes
 
-            class PMC(ctypes.Structure):
-                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
-                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
-                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+            if not _WIN_PMC:
+                class PMC(ctypes.Structure):
+                    _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+                _WIN_PMC.append(PMC)
+            PMC = _WIN_PMC[0]
             k, ps = ctypes.windll.kernel32, ctypes.windll.psapi
             k.OpenProcess.restype = wintypes.HANDLE
             h = k.OpenProcess(0x1000 | 0x0010, False, pid)
@@ -2440,9 +2484,7 @@ class Index:
             lst = self.tokens.get(t)
             if lst:
                 cand += lst
-        cand += self.generic
-        cand += self.regex
-        return any(r.check(url, first, rtype, third, host) for r in cand)
+        return any(r.check(url, first, rtype, third, host) for r in _chain(cand, self.generic, self.regex))
 
 
 SCRIPTLETS = {
@@ -3454,6 +3496,10 @@ class AdBlock(QObject):
             times = [p.stat().st_mtime for p in paths]
             self.engine = eng
             self.cache = {}
+            try:
+                gc.freeze()   # the rule tables are long-lived; keep every later collection from re-scanning them
+            except Exception:
+                pass
             self.updated = min(times) if times else 0.0
         except Exception:
             pass
@@ -3843,11 +3889,6 @@ class QMenu(_QMenu):
                 if not self.isVisible():
                     self.setWindowOpacity(1.0)
                     return
-                if not sub:
-                    end = self.pos()
-                    start = QPoint(end.x(), end.y() - 8)
-                    self.move(start)
-                    animate(self, b"pos", start, end, 200)
                 animate(self, b"windowOpacity", 0.0, 1.0, 140 if sub else 180)
             except RuntimeError:
                 pass
@@ -3904,6 +3945,833 @@ def style_completer_popup(pop):
     pop.setStyleSheet(themed(popup_qss()))
     if isinstance(pop, GlassListView):
         pop.sync_mode()
+
+
+# ====================================================================================================
+# 21b  BORDERLESS DIALOGS (every dialog draws its own frame, title and close button in the current look)
+# ====================================================================================================
+
+def dialog_qss():
+    """Stylesheet for the inside of a Fjord dialog, per look: Terminal, macOS, Windows or Default."""
+    acc = ACCENT["main"]
+    base = "QDialog#fjorddlg, QWidget#dlgbody { background: transparent; }"
+    if term_on():
+        return base + (
+            "QLabel { color:#8dffb0; background:transparent; } QLabel#dlgsub { color:#12b84a; }"
+            "QLineEdit, QKeySequenceEdit { background:#000000; color:#8dffb0; border:1px solid #12b84a; border-radius:2px;"
+            " padding:6px 8px; selection-background-color:#12b84a; selection-color:#030704; }"
+            "QLineEdit:focus, QKeySequenceEdit:focus { border:1px solid #2bff6a; }"
+            "QPushButton { background:transparent; color:#2bff6a; border:1px solid #12b84a; border-radius:2px; padding:6px 16px; min-width:64px; }"
+            "QPushButton:hover { background:#2bff6a; color:#030704; }"
+            "QPushButton:disabled { color:#0d7a31; border:1px solid #0d4d22; background:transparent; }"
+            "QPushButton[primary=\"true\"] { border:1px solid #2bff6a; }"
+            "QAbstractItemView { background:#000000; color:#8dffb0; border:1px solid #12b84a; border-radius:2px; outline:none; }"
+            "QAbstractItemView::item:selected { background:#12b84a; color:#030704; }"
+            "QHeaderView::section { background:#030704; color:#12b84a; border:none; padding:4px 6px; }"
+            "QComboBox { background:#000000; color:#8dffb0; border:1px solid #12b84a; border-radius:2px; padding:4px 8px; }"
+            "QComboBox QAbstractItemView { background:#030704; selection-background-color:#12b84a; selection-color:#030704; }"
+            "QToolButton { background:transparent; color:#2bff6a; border:1px solid transparent; border-radius:2px; }"
+            "QToolButton:hover { border:1px solid #12b84a; }"
+            "QSpinBox, QTextEdit { background:#000000; color:#8dffb0; border:1px solid #12b84a; border-radius:2px; }")
+    mode = UI["mode"]
+    if mode == "mac":
+        edit = ("QLineEdit, QKeySequenceEdit { background:rgba(255,255,255,0.07); color:#e4edf3; border:1px solid rgba(255,255,255,0.12);"
+                " border-radius:14px; padding:7px 14px; selection-background-color:%s; selection-color:#0b141d; }"
+                "QLineEdit:focus, QKeySequenceEdit:focus { background:rgba(255,255,255,0.10); border:1px solid %s; }" % (acc, acc))
+        prim = ("QPushButton[primary=\"true\"] { background:rgba(79,176,232,0.38); color:#ffffff; border:1px solid rgba(255,255,255,0.22); }"
+                "QPushButton[primary=\"true\"]:hover { background:rgba(79,176,232,0.52); }")
+        rad = "10px"
+    elif mode == "windows":
+        edit = ("QLineEdit, QKeySequenceEdit { background:rgba(255,255,255,0.06); color:#e4edf3; border:1px solid rgba(255,255,255,0.08);"
+                " border-bottom:1px solid rgba(255,255,255,0.35); border-radius:5px; padding:6px 10px;"
+                " selection-background-color:%s; selection-color:#0b141d; }"
+                "QLineEdit:focus, QKeySequenceEdit:focus { background:#1c2b3a; border:1px solid rgba(255,255,255,0.08);"
+                " border-bottom:2px solid %s; }" % (acc, acc))
+        prim = ("QPushButton[primary=\"true\"] { background:#4fb0e8; color:#0b141d; border:none; font-weight:600; }"
+                "QPushButton[primary=\"true\"]:hover { background:rgba(79,176,232,0.86); }")
+        rad = "5px"
+    else:
+        edit = ("QLineEdit, QKeySequenceEdit { background:#1c2b3a; color:#e4edf3; border:1px solid #2b3f54; border-radius:10px; padding:7px 12px;"
+                " selection-background-color:%s; selection-color:#0b141d; }"
+                "QLineEdit:focus, QKeySequenceEdit:focus { border:1px solid %s; }" % (acc, acc))
+        prim = ("QPushButton[primary=\"true\"] { background:#4fb0e8; color:#0b141d; border:none; font-weight:600; }"
+                "QPushButton[primary=\"true\"]:hover { background:rgba(79,176,232,0.86); }")
+        rad = "10px"
+    views = ("QAbstractItemView { background:rgba(255,255,255,0.04); color:#e4edf3; border:1px solid rgba(255,255,255,0.08);"
+             " border-radius:%s; outline:none; }"
+             "QAbstractItemView::item { padding:3px 4px; }"
+             "QAbstractItemView::item:selected { background:rgba(79,176,232,0.28); color:#ffffff; }"
+             "QHeaderView::section { background:transparent; color:#8ea3b4; border:none; padding:4px 6px; }"
+             "QComboBox { background:#1c2b3a; color:#e4edf3; border:1px solid #2b3f54; border-radius:%s; padding:4px 10px; }"
+             "QComboBox QAbstractItemView { background:#132029; selection-background-color:rgba(79,176,232,0.3); }"
+             "QSpinBox { background:#1c2b3a; color:#e4edf3; border:1px solid #2b3f54; border-radius:%s; padding:3px 6px; }"
+             % (rad, rad, rad))
+    return (base + "QLabel { color:#e4edf3; background:transparent; } QLabel#dlgsub { color:#8ea3b4; }"
+            + edit + prim + views)
+
+
+def paint_dialog_panel(p, rect, blur, base="#101b26"):
+    """The body of a Fjord dialog: terminal pane, macOS frosted glass, or the flat panel of the Windows / Default look."""
+    if term_on():
+        paint_term_panel(p, rect)
+        return
+    mode = UI["mode"]
+    if mode == "mac":
+        try:
+            paint_glass_panel(p, rect, 20, blur, base)
+            return
+        except Exception:
+            log_error("dialog glass paint")
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    win = mode == "windows"
+    rad = rr(8 if win else 16)
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), rad, rad)
+    p.setPen(QPen(QColor(255, 255, 255, 28) if win else QColor(themed("#2b3f54")), 1))
+    p.setBrush(QColor(themed(base)))
+    p.drawPath(path)
+
+
+class DlgCloseButton(QAbstractButton):
+    """The dialog's own close button, drawn in the current look: red traffic light (macOS), caption X (Windows),
+    [x] (Terminal) or a round X (Default)."""
+    def __init__(self, bar):
+        super().__init__(bar)
+        self.bar = bar
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Close")
+        self.apply_look()
+
+    def apply_look(self):
+        k = style_key()
+        self.setFixedSize(*{"mac": (22, 22), "windows": (46, 32), "term": (34, 22)}.get(k, (28, 28)))
+
+    def enterEvent(self, e):
+        super().enterEvent(e)
+        self.update()
+
+    def leaveEvent(self, e):
+        super().leaveEvent(e)
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        k = style_key()
+        r = QRectF(self.rect())
+        c = r.center()
+        hov, down = self.underMouse(), self.isDown()
+        x, y = c.x(), c.y()
+        if k == "mac":
+            lit = self.window().isActiveWindow() or hov
+            base = QColor(255, 95, 87) if lit else QColor(96, 104, 112)
+            if down:
+                base = base.darker(135)
+            p.setPen(QPen(QColor(0, 0, 0, 55), 0.8))
+            p.setBrush(base)
+            p.drawEllipse(QRectF(x - 6.5, y - 6.5, 13, 13))
+            if hov:
+                p.setPen(QPen(QColor(0, 0, 0, 150), 1.3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.drawLine(QPointF(x - 2.6, y - 2.6), QPointF(x + 2.6, y + 2.6))
+                p.drawLine(QPointF(x - 2.6, y + 2.6), QPointF(x + 2.6, y - 2.6))
+        elif k == "term":
+            if hov or down:
+                p.fillRect(r.adjusted(1, 1, -1, -1), QColor(TERM_BRIGHT))
+            p.setPen(QColor(TERM_BG) if (hov or down) else QColor(TERM_BRIGHT))
+            f = QFont(self.font())
+            f.setBold(True)
+            p.setFont(f)
+            p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), "[x]")
+        elif k == "windows":
+            if hov or down:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(196, 43, 28) if down else QColor(232, 17, 35))
+                rad = rr(8)
+                # square on every corner but the dialog's top-right one, which follows the panel's rounding
+                path = QPainterPath()
+                path.moveTo(r.left(), r.top())
+                path.lineTo(r.right() - rad, r.top())
+                path.quadTo(r.right(), r.top(), r.right(), r.top() + rad)
+                path.lineTo(r.right(), r.bottom())
+                path.lineTo(r.left(), r.bottom())
+                path.closeSubpath()
+                p.drawPath(path)
+            p.setPen(QPen(QColor("#ffffff") if hov else QColor(themed("#b5c6d4")), 1.3, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap))
+            s = 4.8
+            p.drawLine(QPointF(x - s, y - s), QPointF(x + s, y + s))
+            p.drawLine(QPointF(x - s, y + s), QPointF(x + s, y - s))
+        else:
+            if hov or down:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(255, 255, 255, 38 if down else 22))
+                p.drawEllipse(r.adjusted(2, 2, -2, -2))
+            p.setPen(QPen(QColor("#ffffff") if hov else QColor(themed("#8ea3b4")), 1.4, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap))
+            s = 4.4
+            p.drawLine(QPointF(x - s, y - s), QPointF(x + s, y + s))
+            p.drawLine(QPointF(x - s, y + s), QPointF(x + s, y - s))
+        p.end()
+
+
+class DlgTitleBar(QWidget):
+    """The strip along the top of a Fjord dialog: its title, the close button, and drag-to-move."""
+    def __init__(self, dlg):
+        super().__init__(dlg)
+        self.dlg = dlg
+        self.close_btn = DlgCloseButton(self)
+        self.close_btn.clicked.connect(dlg.reject)
+        self._drag = None
+        self.apply_look()
+
+    def apply_look(self):
+        self.setFixedHeight({"mac": 40, "windows": 32, "term": 30}.get(style_key(), 42))
+        self.close_btn.apply_look()
+        self._place()
+
+    def _place(self):
+        k, b = style_key(), self.close_btn
+        if k == "mac":
+            b.move(12, (self.height() - b.height()) // 2)
+        elif k == "windows":
+            b.move(self.width() - b.width(), 0)
+        elif k == "term":
+            b.move(self.width() - b.width() - 6, (self.height() - b.height()) // 2)
+        else:
+            b.move(self.width() - b.width() - 10, (self.height() - b.height()) // 2)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._place()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        k = style_key()
+        title = self.dlg.windowTitle()
+        f = QFont(self.font())
+        f.setBold(True)
+        f.setPixelSize(12 if k in ("windows", "term") else 13)
+        p.setFont(f)
+        r = QRectF(self.rect())
+        if k == "mac":
+            p.setPen(QColor(228, 237, 243, 190))
+            p.drawText(r.adjusted(40, 0, -40, 0), int(Qt.AlignmentFlag.AlignCenter), title)
+        elif k == "term":
+            p.setPen(QColor(TERM_BRIGHT))
+            slug = "~/" + (title.strip().lower().replace(" ", "-") or "dialog")
+            p.drawText(r.adjusted(12, 0, -44, 0), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), slug)
+            p.setPen(QPen(QColor(18, 184, 74, 120), 1))
+            p.drawLine(QPointF(r.left() + 1, r.bottom() - 0.5), QPointF(r.right() - 1, r.bottom() - 0.5))
+        elif k == "windows":
+            p.setPen(QColor(themed("#e4edf3")))
+            p.drawText(r.adjusted(14, 0, -50, 0), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), title)
+        else:
+            p.setPen(QColor(themed("#e4edf3")))
+            p.drawText(r.adjusted(20, 0, -46, 0), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), title)
+        p.end()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            h = self.dlg.windowHandle()
+            try:
+                if h is not None and h.startSystemMove():
+                    e.accept()
+                    return
+            except Exception:
+                pass
+            self._drag = e.globalPosition().toPoint() - self.dlg.frameGeometry().topLeft()
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None and e.buttons() & Qt.MouseButton.LeftButton:
+            self.dlg.move(e.globalPosition().toPoint() - self._drag)
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._drag = None
+        super().mouseReleaseEvent(e)
+
+
+class FjordDialog(QDialog):
+    """Base for every Fjord dialog: no system frame. It draws its own panel, title and close button in the current look
+    (macOS glass + traffic light, Windows flat panel + caption X, Terminal pane + [x], or the Default rounded panel), can be
+    dragged by its title, and closes on Esc or its close button. Put content in `self.body_lay`."""
+    def __init__(self, parent=None, title=""):
+        super().__init__(parent, Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setObjectName("fjorddlg")
+        self.setModal(True)
+        self._blur = None
+        self._anim = None
+        self._shown_once = False
+        self._closing = False
+        self.setWindowOpacity(0.0)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(1, 1, 1, 1)
+        outer.setSpacing(0)
+        self.bar = DlgTitleBar(self)
+        outer.addWidget(self.bar)
+        self.body = QWidget()
+        self.body.setObjectName("dlgbody")
+        self.body_lay = QVBoxLayout(self.body)
+        self.body_lay.setContentsMargins(22, 4, 22, 20)
+        self.body_lay.setSpacing(10)
+        outer.addWidget(self.body, 1)
+        self.setStyleSheet(themed(dialog_qss()))
+        if title:
+            self.setWindowTitle(title)
+
+    def setWindowTitle(self, t):
+        super().setWindowTitle(t)
+        self.bar.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        try:
+            paint_dialog_panel(p, self.rect(), self._blur)
+        finally:
+            p.end()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if UI["mode"] == "mac" and not term_on() and self._blur is None:
+            self._blur = glass_backdrop(self, self.parentWidget())
+            self.update()
+        self._anim_in()
+
+    def _anim_in(self):
+        """Fade (and, outside the glass look, a short rise) when a dialog opens."""
+        if self._shown_once:
+            return
+        self._shown_once = True
+        from PyQt6.QtCore import QParallelAnimationGroup
+        grp = QParallelAnimationGroup(self)
+        fade = QPropertyAnimation(self, b"windowOpacity", self)
+        fade.setDuration(190)
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+        fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        grp.addAnimation(fade)
+        if UI["mode"] != "mac":
+            end = self.pos()
+            rise = QPropertyAnimation(self, b"pos", self)
+            rise.setDuration(240)
+            rise.setStartValue(QPoint(end.x(), end.y() + 14))
+            rise.setEndValue(end)
+            rise.setEasingCurve(QEasingCurve.Type.OutCubic)
+            grp.addAnimation(rise)
+            self.move(end.x(), end.y() + 14)
+        self._anim = grp
+        grp.start()
+
+    def done(self, r):
+        """Fade out before closing; the dialog's exec() returns once the fade has finished."""
+        if self._closing:
+            return
+        if not self.isVisible() or not self._shown_once:
+            QDialog.done(self, r)
+            return
+        self._closing = True
+        if self._anim is not None:
+            self._anim.stop()
+        fade = QPropertyAnimation(self, b"windowOpacity", self)
+        fade.setDuration(130)
+        fade.setStartValue(self.windowOpacity())
+        fade.setEndValue(0.0)
+        fade.setEasingCurve(QEasingCurve.Type.InCubic)
+        fade.finished.connect(lambda: self._finish_close(r))
+        self._anim = fade
+        fade.start()
+
+    def _finish_close(self, r):
+        QDialog.done(self, r)
+        self._closing = False
+        self._shown_once = False
+        self.setWindowOpacity(0.0)
+
+    def shake(self):
+        """A quick side-to-side wiggle, for a wrong password and the like."""
+        if self._closing:
+            return
+        if self._anim is not None:
+            self._anim.stop()
+        x0 = self.pos()
+        a = QPropertyAnimation(self, b"pos", self)
+        a.setDuration(340)
+        for t, dx in ((0.0, 0), (0.15, -10), (0.35, 10), (0.55, -7), (0.75, 4), (1.0, 0)):
+            a.setKeyValueAt(t, QPoint(x0.x() + dx, x0.y()))
+        self._anim = a
+        a.start()
+
+    def changeEvent(self, e):
+        if e.type() == QEvent.Type.ActivationChange:
+            self.bar.close_btn.update()
+        super().changeEvent(e)
+
+    def button_row(self, *buttons):
+        """A right-aligned row of buttons (first = leftmost). Returns the layout."""
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addStretch()
+        for b in buttons:
+            row.addWidget(b)
+        return row
+
+    @staticmethod
+    def make_button(text, primary=False, slot=None):
+        b = QPushButton(text)
+        b.setAutoDefault(False)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        if primary:
+            b.setProperty("primary", True)
+        if slot is not None:
+            b.clicked.connect(slot)
+        return b
+
+
+_SB = _QMessageBox.StandardButton
+_SB_TEXT = {_SB.Yes: "Yes", _SB.No: "No", _SB.Ok: "OK", _SB.Open: "Open", _SB.Save: "Save", _SB.Discard: "Discard",
+            _SB.Apply: "Apply", _SB.Close: "Close", _SB.Cancel: "Cancel"}
+_SB_ORDER = (_SB.Cancel, _SB.No, _SB.Discard, _SB.Close, _SB.Apply, _SB.Ok, _SB.Open, _SB.Save, _SB.Yes)
+_SB_YES = (_SB.Yes, _SB.Ok, _SB.Open, _SB.Save, _SB.Apply)
+
+
+class DlgIcon(QWidget):
+    """The little question / warning / info / error badge on a message box, in the current look."""
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+        self.setFixedSize(38, 38)
+
+    def paintEvent(self, e):
+        I = _QMessageBox.Icon
+        glyph, col = {I.Question: ("?", ACCENT["main"]), I.Warning: ("!", "#f5b84a"), I.Information: ("i", ACCENT["main"]),
+                      I.Critical: ("\u00d7", "#ff6b6b")}.get(self.kind, ("", ACCENT["main"]))
+        if not glyph:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(3, 3, -3, -3)
+        f = QFont(self.font())
+        f.setBold(True)
+        if term_on():
+            col = {"?": TERM_BRIGHT, "!": TERM_WARN, "i": TERM_BRIGHT, "\u00d7": "#ff6b6b"}[glyph]
+            f.setPixelSize(20)
+            p.setFont(f)
+            p.setPen(QColor(col))
+            p.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter), "[%s]" % glyph)
+        else:
+            c = QColor(col)
+            p.setPen(QPen(c, 1.6))
+            fill = QColor(c)
+            fill.setAlpha(46)
+            p.setBrush(fill)
+            p.drawEllipse(r)
+            f.setPixelSize(20)
+            p.setFont(f)
+            p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), glyph)
+        p.end()
+
+
+class FjordMessageBox(FjordDialog):
+    """Drop-in for QMessageBox: same static helpers (question / warning / information / critical) and the same
+    setText / setInformativeText / setStandardButtons / exec() calls, but borderless and themed."""
+    StandardButton = _QMessageBox.StandardButton
+    Icon = _QMessageBox.Icon
+
+    def __init__(self, parent=None, title="", text="", icon=None, buttons=None, default=None):
+        super().__init__(parent, title)
+        self._icon = icon if icon is not None else _QMessageBox.Icon.NoIcon
+        self._text, self._info = text, ""
+        self._buttons = buttons if buttons is not None else _SB.Ok
+        self._default = default if default is not None else _SB.NoButton
+        self._flags = None
+        self._clicked = None
+        self._btns = {}
+
+    def setIcon(self, icon):
+        self._icon = icon
+
+    def setText(self, text):
+        self._text = text
+
+    def setInformativeText(self, text):
+        self._info = text
+
+    def setStandardButtons(self, buttons):
+        self._buttons = buttons
+
+    def setDefaultButton(self, button):
+        self._default = button
+
+    def setTextInteractionFlags(self, flags):
+        self._flags = flags
+
+    def _present(self):
+        return [sb for sb in _SB_ORDER if self._buttons & sb]
+
+    def _escape(self):
+        have = self._present()
+        for sb in (_SB.Cancel, _SB.No):
+            if sb in have:
+                return sb
+        return have[0] if len(have) == 1 else _SB.NoButton
+
+    def _build(self):
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        if self._icon != _QMessageBox.Icon.NoIcon:
+            ic = DlgIcon(self._icon)
+            row.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(6)
+        for txt, sub in ((self._text, False), (self._info, True)):
+            if not txt:
+                continue
+            lab = QLabel(txt)
+            lab.setWordWrap(True)
+            lab.setTextFormat(Qt.TextFormat.PlainText)
+            if sub:
+                lab.setObjectName("dlgsub")
+            if self._flags is not None:
+                lab.setTextInteractionFlags(self._flags)
+            col.addWidget(lab)
+        row.addLayout(col, 1)
+        self.body_lay.addLayout(row)
+        have = self._present()
+        default = self._default if self._default in have else next((s for s in _SB_YES if s in have), None)
+        if default is None and have:
+            default = have[-1]
+        order = list(reversed(have)) if style_key() == "windows" else have
+        btns = []
+        for sb in order:
+            b = self.make_button(_SB_TEXT[sb], primary=(sb == default), slot=lambda _c=False, s=sb: self._pick(s))
+            if sb == default:
+                b.setAutoDefault(True)
+                b.setDefault(True)
+            self._btns[sb] = b
+            btns.append(b)
+        self.body_lay.addSpacing(6)
+        self.body_lay.addLayout(self.button_row(*btns))
+        n = len((self._text or "") + (self._info or ""))
+        self.setFixedWidth(500 if n > 180 else 420)
+        if default in self._btns:
+            self._btns[default].setFocus()
+
+    def _pick(self, sb):
+        self._clicked = sb
+        self.accept()
+
+    def reject(self):
+        if self._clicked is None:
+            self._clicked = self._escape()
+        super().reject()
+
+    def exec(self):
+        self._build()
+        super().exec()
+        return self._clicked if self._clicked is not None else self._escape()
+
+    @staticmethod
+    def _run(parent, title, text, icon, buttons, default):
+        box = FjordMessageBox(parent, title, text, icon, buttons, default)
+        return box.exec()
+
+    @staticmethod
+    def question(parent, title, text, buttons=_SB.Yes | _SB.No, defaultButton=_SB.NoButton):
+        return FjordMessageBox._run(parent, title, text, _QMessageBox.Icon.Question, buttons, defaultButton)
+
+    @staticmethod
+    def warning(parent, title, text, buttons=_SB.Ok, defaultButton=_SB.NoButton):
+        return FjordMessageBox._run(parent, title, text, _QMessageBox.Icon.Warning, buttons, defaultButton)
+
+    @staticmethod
+    def information(parent, title, text, buttons=_SB.Ok, defaultButton=_SB.NoButton):
+        return FjordMessageBox._run(parent, title, text, _QMessageBox.Icon.Information, buttons, defaultButton)
+
+    @staticmethod
+    def critical(parent, title, text, buttons=_SB.Ok, defaultButton=_SB.NoButton):
+        return FjordMessageBox._run(parent, title, text, _QMessageBox.Icon.Critical, buttons, defaultButton)
+
+
+class FjordInputDialog(FjordDialog):
+    """A one-line text prompt (name a group, choose a master password...) in the current look."""
+    def __init__(self, parent, title, label, echo, text):
+        super().__init__(parent, title)
+        self.setFixedWidth(400)
+        lab = QLabel(label)
+        lab.setWordWrap(True)
+        lab.setTextFormat(Qt.TextFormat.PlainText)
+        self.body_lay.addWidget(lab)
+        self.edit = QLineEdit(text)
+        self.edit.setEchoMode(echo)
+        self.edit.returnPressed.connect(self.accept)
+        self.body_lay.addWidget(self.edit)
+        self.body_lay.addSpacing(6)
+        self.body_lay.addLayout(self.button_row(*(
+            [self.make_button("OK", True, self.accept), self.make_button("Cancel", False, self.reject)]
+            if style_key() == "windows" else
+            [self.make_button("Cancel", False, self.reject), self.make_button("OK", True, self.accept)])))
+        self.edit.setFocus()
+        self.edit.selectAll()
+
+    @staticmethod
+    def getText(parent, title, label, echo=QLineEdit.EchoMode.Normal, text="", *_a, **_k):
+        d = FjordInputDialog(parent, title, label, echo, text)
+        ok = d.exec() == QDialog.DialogCode.Accepted
+        return (d.edit.text() if ok else ""), ok
+
+
+def _embed_dialog(parent, inner, title, size):
+    """Wrap a Qt dialog (file picker, colour picker) in a FjordDialog so it gets the same borderless themed frame."""
+    host = FjordDialog(parent, title)
+    host.body_lay.setContentsMargins(12, 2, 12, 12)
+    inner.setWindowFlags(Qt.WindowType.Widget)
+    inner.setSizeGripEnabled(False)
+    host.body_lay.addWidget(inner)
+    inner.accepted.connect(host.accept)
+    inner.rejected.connect(host.reject)
+    host.resize(*size)
+    return host
+
+
+_FD_SHAPES = {
+    "back": '<path d="M15 5l-7 7 7 7"/>',
+    "forward": '<path d="M9 5l7 7-7 7"/>',
+    "up": '<path d="M12 19V6M6 11l6-6 6 6"/>',
+    "newfolder": '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 10.5v5M9.5 13h5"/>',
+    "grid": '<rect x="4" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.5"/>',
+    "details": '<path d="M4 6h2M9 6h11M4 12h2M9 12h11M4 18h2M9 18h11"/>',
+    "desktop": '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
+    "downloads": '<path d="M12 4v11M7 11l5 5 5-5M5 20h14"/>',
+    "documents": '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/>',
+    "pictures": '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M3 17l5-5 4 4 3-3 6 5"/>',
+    "music": '<path d="M9 18V6l10-2v12"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="16.5" cy="16" r="2.5"/>',
+    "videos": '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M3 15h18M8 4v16M16 4v16"/>',
+    "drive": '<rect x="3" y="13" width="18" height="7" rx="2"/><path d="M5 13l2-8h10l2 8"/><path d="M16.5 16.5h.01"/>',
+    "pin": '<path d="M9 3h6l-1 6 3 3v1.5H7V12l3-3z"/><path d="M12 13.5V21"/>',
+}
+
+
+def _fd_pixmap(kind, color, size=40):
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%s" stroke-width="1.7" '
+           'stroke-linecap="round" stroke-linejoin="round">%s</svg>' % (color, _FD_SHAPES[kind]))
+    r = QSvgRenderer(svg.encode())
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    r.render(p, QRectF(0, 0, size, size))
+    p.end()
+    return pm
+
+
+def _fd_icon(kind, color, dim):
+    ic = QIcon()
+    ic.addPixmap(_fd_pixmap(kind, color), QIcon.Mode.Normal)
+    ic.addPixmap(_fd_pixmap(kind, color), QIcon.Mode.Active)
+    ic.addPixmap(_fd_pixmap(kind, dim), QIcon.Mode.Disabled)
+    return ic
+
+
+class _FdRoundDelegate(QStyledItemDelegate):
+    """Paints selection and hover as a rounded pill instead of Qt's square box. In the details view the pill spans the whole row."""
+    @staticmethod
+    def _pill(sel):
+        if term_on():
+            return QColor(18, 184, 74, 80 if sel else 30)
+        return accent_color(90) if sel else QColor(255, 255, 255, 20)
+
+    def paint(self, p, opt, index):
+        o = QStyleOptionViewItem(opt)
+        self.initStyleOption(o, index)
+        S = QStyle.StateFlag
+        sel, hov = bool(o.state & S.State_Selected), bool(o.state & S.State_MouseOver)
+        if sel or hov:
+            view = self.parent()
+            row = QRectF(o.rect)
+            if callable(getattr(view, "header", None)):
+                row = QRectF(0, o.rect.top(), view.viewport().width(), o.rect.height())
+            row = row.adjusted(3, 1, -3, -1)
+            rad = min(14.0, row.height() / 2.0)
+            p.save()
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setClipRect(o.rect)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(self._pill(sel))
+            p.drawRoundedRect(row, rad, rad)
+            p.restore()
+            o.state = o.state & ~(S.State_Selected | S.State_MouseOver | S.State_HasFocus)
+        QStyledItemDelegate.paint(self, p, o, index)
+
+
+class _FdSideDelegate(_FdRoundDelegate):
+    """Sidebar rows for the file picker: outline icons plus a pin on the quick-access folders, like Windows."""
+    def __init__(self, parent, kinds, icons, pin):
+        super().__init__(parent)
+        self._kinds, self._icons, self._pin = kinds, icons, pin
+
+    def _info(self, index):
+        url = index.data(Qt.ItemDataRole.UserRole + 1)
+        if isinstance(url, QUrl) and url.isLocalFile():
+            pth = os.path.normpath(url.toLocalFile())
+            info = self._kinds.get(os.path.normcase(pth))
+            if info is None and os.path.dirname(pth) == pth:
+                info = ("drive", False)
+            return info
+        return None
+
+    def initStyleOption(self, opt, index):
+        super().initStyleOption(opt, index)
+        info = self._info(index)
+        if info:
+            opt.icon = self._icons[info[0]]
+            opt.decorationSize = QSize(22, 22)
+            opt.features |= QStyleOptionViewItem.ViewItemFeature.HasDecoration
+
+    def paint(self, p, opt, index):
+        super().paint(p, opt, index)
+        info = self._info(index)
+        if info and info[1]:
+            p.save()
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            r = opt.rect
+            p.drawPixmap(QRect(r.right() - 24, r.center().y() - 7, 14, 14), self._pin)
+            p.restore()
+
+
+def _style_file_dialog(inner):
+    """Swap Qt's stock toolbar icons for clean outline ones and give the sidebar Windows-style Quick access."""
+    if QSvgRenderer is None:
+        return
+    from PyQt6.QtCore import QDir, QStandardPaths
+    col, dim = ("#2bff6a", "#0d7a31") if term_on() else ("#e4edf3", "#5d7184")
+    for name, kind in (("backButton", "back"), ("forwardButton", "forward"), ("toParentButton", "up"),
+                       ("newFolderButton", "newfolder"), ("listModeButton", "grid"), ("detailModeButton", "details")):
+        b = inner.findChild(QToolButton, name)
+        if b is not None:
+            b.setIcon(_fd_icon(kind, col, dim))
+            b.setIconSize(QSize(20, 20))
+    SL = QStandardPaths.StandardLocation
+    urls, kinds = [], {}
+    for loc, kind in ((SL.DesktopLocation, "desktop"), (SL.DownloadLocation, "downloads"),
+                      (SL.DocumentsLocation, "documents"), (SL.PicturesLocation, "pictures"),
+                      (SL.MusicLocation, "music"), (SL.MoviesLocation, "videos")):
+        pth = QStandardPaths.writableLocation(loc)
+        key = os.path.normcase(os.path.normpath(pth)) if pth else ""
+        if pth and os.path.isdir(pth) and key not in kinds:
+            urls.append(QUrl.fromLocalFile(pth))
+            kinds[key] = (kind, True)
+    for d in QDir.drives():
+        pth = d.absoluteFilePath()
+        urls.append(QUrl.fromLocalFile(pth))
+        kinds[os.path.normcase(os.path.normpath(pth))] = ("drive", False)
+    inner.setSidebarUrls(urls)
+    side = inner.findChild(QListView, "sidebar")
+    if side is not None:
+        icons = {k: _fd_icon(k, col, dim) for k in ("desktop", "downloads", "documents", "pictures", "music", "videos", "drive")}
+        side.setIconSize(QSize(22, 22))
+        side.setItemDelegate(_FdSideDelegate(side, kinds, icons, _fd_pixmap("pin", dim)))
+    from PyQt6.QtWidgets import QTreeView
+    for cls, name in ((QTreeView, "treeView"), (QListView, "listView")):
+        v = inner.findChild(cls, name)
+        if v is not None:
+            v.setItemDelegate(_FdRoundDelegate(v))
+    inner.setStyleSheet("QTreeView::item:selected, QTreeView::item:hover, QListView::item:selected, QListView::item:hover"
+                        " { background: transparent; border: none; }")
+
+
+class FjordFileDialog:
+    """Drop-in for the static QFileDialog pickers. Uses Qt's own (non-native) file browser inside a Fjord frame."""
+    Option = _QFileDialog.Option
+    FileMode = _QFileDialog.FileMode
+    AcceptMode = _QFileDialog.AcceptMode
+
+    @staticmethod
+    def _run(parent, caption, directory, flt, mode, accept, options):
+        inner = _QFileDialog()
+        inner.setFileMode(mode)
+        inner.setAcceptMode(accept)
+        opts = _QFileDialog.Option.DontUseNativeDialog
+        if options is not None:
+            opts |= options
+        if accept == _QFileDialog.AcceptMode.AcceptSave:
+            opts |= _QFileDialog.Option.DontConfirmOverwrite
+        inner.setOptions(opts)
+        if directory:
+            pth = Path(directory)
+            if accept == _QFileDialog.AcceptMode.AcceptSave and not pth.is_dir():
+                inner.setDirectory(str(pth.parent))
+                inner.selectFile(pth.name)
+            else:
+                inner.setDirectory(str(pth))
+        if flt:
+            inner.setNameFilter(flt)
+        try:
+            _style_file_dialog(inner)
+        except Exception:
+            pass
+        host = _embed_dialog(parent, inner, caption or "Choose", (780, 520))
+        if host.exec() != QDialog.DialogCode.Accepted:
+            return [], ""
+        files = inner.selectedFiles()
+        if accept == _QFileDialog.AcceptMode.AcceptSave and files and Path(files[0]).exists():
+            if FjordMessageBox.question(parent, "Replace file?", "%s already exists. Replace it?" % Path(files[0]).name,
+                                        _SB.Yes | _SB.No, _SB.No) != _SB.Yes:
+                return [], ""
+        return files, inner.selectedNameFilter()
+
+    @staticmethod
+    def getOpenFileName(parent=None, caption="", directory="", filter="", selectedFilter="", options=None):
+        files, f = FjordFileDialog._run(parent, caption, directory, filter, _QFileDialog.FileMode.ExistingFile,
+                                        _QFileDialog.AcceptMode.AcceptOpen, options)
+        return (files[0] if files else ""), f
+
+    @staticmethod
+    def getOpenFileNames(parent=None, caption="", directory="", filter="", selectedFilter="", options=None):
+        files, f = FjordFileDialog._run(parent, caption, directory, filter, _QFileDialog.FileMode.ExistingFiles,
+                                        _QFileDialog.AcceptMode.AcceptOpen, options)
+        return list(files), f
+
+    @staticmethod
+    def getSaveFileName(parent=None, caption="", directory="", filter="", selectedFilter="", options=None):
+        files, f = FjordFileDialog._run(parent, caption, directory, filter, _QFileDialog.FileMode.AnyFile,
+                                        _QFileDialog.AcceptMode.AcceptSave, options)
+        return (files[0] if files else ""), f
+
+    @staticmethod
+    def getExistingDirectory(parent=None, caption="", directory="", options=None):
+        opts = _QFileDialog.Option.ShowDirsOnly
+        if options is not None:
+            opts |= options
+        files, _f = FjordFileDialog._run(parent, caption, directory, "", _QFileDialog.FileMode.Directory,
+                                         _QFileDialog.AcceptMode.AcceptOpen, opts)
+        return files[0] if files else ""
+
+
+class FjordColorDialog:
+    """Drop-in for QColorDialog.getColor, inside a Fjord frame."""
+    @staticmethod
+    def getColor(initial=None, parent=None, title="", options=None):
+        inner = _QColorDialog(initial if initial is not None else QColor(255, 255, 255))
+        inner.setOption(_QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        host = _embed_dialog(parent, inner, title or "Pick a colour", (560, 440))
+        if host.exec() == QDialog.DialogCode.Accepted:
+            return inner.currentColor()
+        return QColor()
+
+
+# Every call site keeps saying QMessageBox / QInputDialog / QFileDialog / QColorDialog; these now resolve to the Fjord versions.
+QMessageBox = FjordMessageBox
+QInputDialog = FjordInputDialog
+QFileDialog = FjordFileDialog
+QColorDialog = FjordColorDialog
 
 
 class GlassPopup(QFrame):
@@ -3984,10 +4852,6 @@ class GlassPopup(QFrame):
                 if not self.isVisible():
                     self.setWindowOpacity(1.0)
                     return
-                end = self.pos()
-                start = QPoint(end.x(), end.y() - 10)
-                self.move(start)
-                animate(self, b"pos", start, end, 240)
                 animate(self, b"windowOpacity", 0.0, 1.0, 200)
                 self._after_intro()
             except RuntimeError:
@@ -3999,9 +4863,7 @@ class GlassPopup(QFrame):
             self._closing = True
             e.ignore()
             setattr(self.win, self.GUARD, time.time())
-            start = self.pos()
-            animate(self, b"pos", start, QPoint(start.x(), start.y() - 6), 150, QEasingCurve.Type.InCubic)
-            animate(self, b"windowOpacity", self.windowOpacity(), 0.0, 150, QEasingCurve.Type.InCubic, done=self.close)
+            animate(self, b"windowOpacity", self.windowOpacity(), 0.0, 130, QEasingCurve.Type.InCubic, done=self.close)
             return
         self._before_close()
         setattr(self.win, self.GUARD, time.time())
@@ -4610,7 +5472,15 @@ class SpeedPopup(GlassPopup):
     @staticmethod
     def _fade_row(eff):
         try:
-            animate(eff, b"opacity", 0.0, 1.0, 240)
+            row = eff.parent()
+
+            def drop():
+                try:
+                    if row.graphicsEffect() is eff:
+                        row.setGraphicsEffect(None)
+                except RuntimeError:
+                    pass
+            animate(eff, b"opacity", 0.0, 1.0, 240, done=lambda: QTimer.singleShot(0, drop))
         except RuntimeError:
             pass
 
@@ -5331,6 +6201,8 @@ def import_html(sources):
 PW_KDF_ITERS = 600000
 PW_FOCUS_SCRIPT = "fjord-pw-watch"
 PW_SAVE_MSG = "__FJORD_PWSAVE__"
+PW_FOCUS_MSG = "__FJORD_PWFOCUS__"   # a login field was clicked into: offer to fill a saved login
+PW_TYPE_MSG = "__FJORD_PWTYPE__"     # the person started typing a password: no point offering to fill any more
 
 
 def _pw_derive_key(master, salt, iters=PW_KDF_ITERS):
@@ -5399,16 +6271,31 @@ class PasswordVault:
         jsave("passwords.json", {"salt": base64.b64encode(self.salt).decode(), "iters": self.iters,
                                  "nonce": base64.b64encode(nonce).decode(), "blob": base64.b64encode(blob).decode()})
 
+    @staticmethod
+    def norm_host(host):
+        """One canonical form for a site, used on both save and lookup: lower-case, no user@, no :port, no leading www."""
+        h = (host or "").strip().lower()
+        if "://" in h:
+            h = urlparse(h).netloc or h
+        h = h.rsplit("@", 1)[-1]
+        if h.startswith("["):
+            h = h[1:h.find("]")] if "]" in h else h[1:]
+        else:
+            h = h.split(":", 1)[0]
+        h = h.rstrip(".")
+        return h[4:] if h.startswith("www.") else h
+
     def for_host(self, host):
-        host = (host or "").lower()
-        return [e for e in self.entries if (e.get("host") or "").lower() == host]
+        host = self.norm_host(host)
+        return [e for e in self.entries if host and self.norm_host(e.get("host")) == host]
 
     def upsert(self, host, username, password):
-        host = (host or "").strip().lower()
+        host = self.norm_host(host)
         if not host or not password:
             return None
         for en in self.entries:
-            if (en.get("host") or "").lower() == host and en.get("username") == username:
+            if self.norm_host(en.get("host")) == host and en.get("username") == username:
+                en["host"] = host
                 en["password"], en["updated"] = password, time.time()
                 self._save()
                 return en["id"]
@@ -5456,7 +6343,7 @@ def read_csv_passwords(path):
 
 PW_SAVE_JS = r"""(function(){
 if(window.top!==window||window.__fjPwWatch||!/^https?:$/.test(location.protocol))return;window.__fjPwWatch=1;
-var log=console.log.bind(console),PFX="__FJORD_PWSAVE__";
+var log=console.log.bind(console),PFX="__FJORD_PWSAVE__",FPFX="__FJORD_PWFOCUS__",TPFX="__FJORD_PWTYPE__";
 function vis(el){return el.getClientRects().length>0;}
 function usernameFor(pass,scope){
  var cands=Array.prototype.filter.call(scope.querySelectorAll('input[type=text],input[type=email],input:not([type])'),vis),best=null;
@@ -5465,8 +6352,34 @@ function usernameFor(pass,scope){
 }
 function report(pass,scope){
  if(!pass||!pass.value)return;
- try{log(PFX+JSON.stringify({u:usernameFor(pass,scope),p:pass.value,h:location.hostname}));}catch(e){}
+ var u=usernameFor(pass,scope),k=u+"\u0001"+pass.value,now=Date.now();
+ if(window.__fjRep&&window.__fjRep.k===k&&now-window.__fjRep.t<1500)return;
+ window.__fjRep={k:k,t:now};
+ try{log(PFX+JSON.stringify({u:u,p:pass.value,h:location.hostname}));}catch(e){}
 }
+function loginish(el){
+ if(!(el instanceof HTMLInputElement))return false;
+ var t=(el.type||'text').toLowerCase();
+ if(t==='password')return true;
+ if(t!=='text'&&t!=='email'&&t!=='tel')return false;
+ return Array.prototype.filter.call((el.form||document).querySelectorAll('input[type=password]'),vis).length>0;
+}
+document.addEventListener('focusin',function(ev){
+ if(!ev.isTrusted)return;
+ var el=ev.target;
+ if(el.__fjPwSeen||!loginish(el)||!vis(el))return;
+ el.__fjPwSeen=1;log(FPFX);
+},true);
+document.addEventListener('input',function(ev){
+ if(!ev.isTrusted)return;
+ var el=ev.target;
+ if(el instanceof HTMLInputElement&&el.type==='password'&&!window.__fjPwTyped){window.__fjPwTyped=1;log(TPFX);}
+},true);
+document.addEventListener('keydown',function(ev){
+ if(ev.key!=='Enter'||!ev.isTrusted)return;
+ var el=ev.target;
+ if(el instanceof HTMLInputElement&&el.type==='password'&&el.value)report(el,el.form||document);
+},true);
 document.addEventListener('submit',function(ev){
  var f=ev.target;if(!(f instanceof HTMLFormElement))return;
  var pass=f.querySelector('input[type=password]');if(pass)report(pass,f);
@@ -5479,22 +6392,44 @@ document.addEventListener('click',function(ev){
 })();"""
 
 PW_FILL_JS = r"""(function(){
-var USER=%s,PASS=%s;
+var USER=%s,PASS=%s,res={pass:0,user:0,ok:0,inputs:0};
 function vis(el){return el.getClientRects().length>0;}
+function deep(root,sel,acc){
+ try{
+  var l=root.querySelectorAll(sel),i;
+  for(i=0;i<l.length;i++)acc.push(l[i]);
+  var all=root.querySelectorAll('*');
+  for(i=0;i<all.length;i++){
+   var el=all[i];
+   if(el.shadowRoot)deep(el.shadowRoot,sel,acc);
+   if(el.tagName==='IFRAME'){try{if(el.contentDocument)deep(el.contentDocument,sel,acc);}catch(e){}}
+  }
+ }catch(e){}
+ return acc;
+}
 function setVal(el,val){
+ try{el.focus();}catch(e){}
  var proto=Object.getPrototypeOf(el),d=proto&&Object.getOwnPropertyDescriptor(proto,'value');
  if(d&&d.set)d.set.call(el,val);else el.value=val;
  el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));
 }
-var pass=Array.prototype.filter.call(document.querySelectorAll('input[type=password]'),vis)[0];
-if(!pass)return;
-if(PASS)setVal(pass,PASS);
-if(USER){
- var scope=pass.closest('form')||document;
- var cands=Array.prototype.filter.call(scope.querySelectorAll('input[type=text],input[type=email],input:not([type])'),vis),best=null;
- for(var i=0;i<cands.length;i++){if(cands[i].compareDocumentPosition(pass)&Node.DOCUMENT_POSITION_FOLLOWING)best=cands[i];}
- if(best)setVal(best,USER);
+function userInput(i){
+ var t=(i.type||'text').toLowerCase();
+ return vis(i)&&!i.disabled&&!i.readOnly&&(t==='text'||t==='email'||t==='tel'||t==='');
 }
+var all=deep(document,'input',[]);
+res.inputs=all.length;
+var pass=all.filter(function(i){return i.type==='password'&&vis(i)&&!i.disabled;})[0]||null;
+var scope=pass?(pass.closest('form')||pass.getRootNode()):document;
+var cands=deep(scope,'input',[]).filter(userInput),best=null,i;
+if(pass){
+ for(i=0;i<cands.length;i++){if(cands[i].compareDocumentPosition(pass)&Node.DOCUMENT_POSITION_FOLLOWING)best=cands[i];}
+}else{
+ best=cands.filter(function(c){return /user|email|login|account|ident/i.test((c.autocomplete||'')+' '+c.name+' '+c.id);})[0]||cands[0]||null;
+}
+if(USER&&best){setVal(best,USER);res.user=1;}
+if(pass&&PASS){setVal(pass,PASS);res.pass=1;res.ok=(pass.value===PASS)?1:0;}
+return JSON.stringify(res);
 })();"""
 
 
@@ -7710,7 +8645,7 @@ class TabSearch(QFrame):
         if W < 2 or H < 2 or pm is None or pm.isNull():
             return
         tip_down = o.center().y() > F.center().y()
-        N, LAG = 56, 0.7
+        N, LAG = 40, 0.7
         bcx, bcy, bw = o.center().x(), float(o.center().y()), float(o.width())
         cx0 = F.center().x()
         pts = []
@@ -8172,16 +9107,64 @@ class TabSearch(QFrame):
 # 33  KEYBIND & MOUSE CAPTURE DIALOGS
 # ====================================================================================================
 
-class KeyCaptureDialog(QDialog):
+class UnlockDialog(FjordDialog):
+    """Asks for the master password and says Correct or Incorrect right in the window. A wrong password leaves the window open
+    so you can try again; a right one shows Correct for a moment and then closes."""
+    def __init__(self, parent, vault, prompt="Master password:"):
+        super().__init__(parent, "Unlock passwords")
+        self.vault = vault
+        self.setMinimumWidth(400)
+        lay = self.body_lay
+        lab = QLabel(prompt)
+        lab.setWordWrap(True)
+        lay.addWidget(lab)
+        self.edit = QLineEdit()
+        self.edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit.textChanged.connect(lambda _t: self.status.setText(""))
+        self.edit.returnPressed.connect(self._try)
+        lay.addWidget(self.edit)
+        self.status = QLabel("")
+        self.status.setMinimumHeight(20)
+        lay.addWidget(self.status)
+        cancel = self.make_button("Cancel", False, self.reject)
+        self.go = self.make_button("Unlock", True, self._try)
+        lay.addLayout(self.button_row(*((self.go, cancel) if style_key() == "windows" else (cancel, self.go))))
+        self.edit.setFocus()
+
+    def _try(self):
+        pw = self.edit.text()
+        if not pw:
+            return
+        self.go.setEnabled(False)
+        self.status.setStyleSheet("")
+        self.status.setText("Checking\u2026")
+        QApplication.processEvents()
+        ok = self.vault.unlock(pw)
+        if ok:
+            self.status.setText("\u2713 Correct")
+            self.status.setStyleSheet("color:#4ade80;font-weight:600")
+            self.edit.setEnabled(False)
+            QTimer.singleShot(450, self.accept)
+            return
+        self.go.setEnabled(True)
+        self.status.setText("\u2717 Incorrect password, try again")
+        self.status.setStyleSheet("color:#ff7a7a;font-weight:600")
+        self.shake()
+        self.edit.selectAll()
+        self.edit.setFocus()
+
+
+def ask_unlock(parent, vault, prompt="Master password:"):
+    """Show the unlock window. True once the vault is unlocked, False if the person cancelled."""
+    return UnlockDialog(parent, vault, prompt).exec() == QDialog.DialogCode.Accepted and not vault.locked
+
+
+class KeyCaptureDialog(FjordDialog):
     """A small window that records the next key combination you press."""
     def __init__(self, parent, label):
-        super().__init__(parent)
-        self.setWindowTitle("New shortcut")
-        self.setModal(True)
-        self.setMinimumWidth(380)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 18, 20, 16)
-        lay.setSpacing(12)
+        super().__init__(parent, "New shortcut")
+        self.setMinimumWidth(400)
+        lay = self.body_lay
         lay.addWidget(QLabel("Press the keys you want for \u201c%s\u201d" % label))
         self.edit = QKeySequenceEdit()
         self.edit.setMaximumSequenceLength(1)
@@ -8191,18 +9174,10 @@ class KeyCaptureDialog(QDialog):
         self.note.setWordWrap(True)
         self.note.setStyleSheet("color:#e8a87c")
         lay.addWidget(self.note)
-        row = QHBoxLayout()
-        row.addStretch()
-        cancel = QPushButton("Cancel")
-        cancel.setAutoDefault(False)
-        cancel.clicked.connect(self.reject)
-        self.save = QPushButton("Save")
-        self.save.setAutoDefault(False)
+        cancel = self.make_button("Cancel", False, self.reject)
+        self.save = self.make_button("Save", True, self._save)
         self.save.setEnabled(False)
-        self.save.clicked.connect(self._save)
-        row.addWidget(cancel)
-        row.addWidget(self.save)
-        lay.addLayout(row)
+        lay.addLayout(self.button_row(*((self.save, cancel) if style_key() == "windows" else (cancel, self.save))))
         self.edit.setFocus()
 
     def _changed(self, ks):
@@ -8289,6 +9264,36 @@ class Page(QWebEnginePage):
         self.loadStarted.connect(lambda: self.tab.browser.perm_drop(self))
         tab.browser.adblock.install(self)
 
+    def chooseFiles(self, mode, old_files, accepted_mimetypes):
+        """Route <input type=file> pickers through Fjord's own themed dialog instead of the native OS one."""
+        FM = QWebEnginePage.FileSelectionMode
+        parent = self.tab.browser
+        start = next((f for f in old_files if f), "")
+        if start and not os.path.isdir(start):
+            start = os.path.dirname(start)
+        if not start or not os.path.isdir(start):
+            start = str(Path.home() / "Downloads")
+        if mode == FM.FileSelectUploadFolder:
+            folder = QFileDialog.getExistingDirectory(parent, "Choose a folder to upload", start)
+            if not folder:
+                return []
+            return [str(p) for p in Path(folder).rglob("*") if p.is_file()]
+        flt = ""
+        if accepted_mimetypes:
+            exts = []
+            for m in accepted_mimetypes:
+                if m.startswith("."):
+                    exts.append("*" + m)
+                else:
+                    exts += ["*" + e for e in mimetypes.guess_all_extensions(m)]
+            if exts:
+                flt = "Accepted files (%s);;All Files (*)" % " ".join(sorted(set(exts)))
+        if mode == FM.FileSelectOpenMultiple:
+            files, _ = QFileDialog.getOpenFileNames(parent, "Choose files", start, flt)
+            return list(files)
+        path, _ = QFileDialog.getOpenFileName(parent, "Choose a file", start, flt)
+        return [path] if path else []
+
     def _on_permission(self, perm):
         kind = PERM_KINDS.get(getattr(perm.permissionType(), "name", ""))
         if kind is None:
@@ -8343,6 +9348,15 @@ class Page(QWebEnginePage):
             if real.scheme() in ("http", "https") and real.host():
                 self.tab.browser.offer_save_password(message[len(PW_SAVE_MSG):], real.host())
             return
+        if message.startswith(PW_FOCUS_MSG):
+            self.tab.browser._af_log("focus: login field message received on %s" % self.url().host())
+            real = self.url()
+            if real.scheme() in ("http", "https") and real.host():
+                self.tab.browser.offer_fill_password(self.tab, real.host())
+            return
+        if message.startswith(PW_TYPE_MSG):
+            self.tab.browser.dismiss_fill_prompt(self.tab)
+            return
         super().javaScriptConsoleMessage(level, message, line, source)
 
 
@@ -8357,7 +9371,9 @@ class Tab(QWebEngineView):
         self.row = None
         self.last_active = time.time()
         self.pending = None
+        self.ess = None        # host of the Essential this tab is pinned as (None = ordinary tab)
         self.thumb = None
+        self.thumb_t = 0.0
         self.volume = 1.0
         self.setPage(Page(profile, self))
 
@@ -8372,16 +9388,24 @@ class Tab(QWebEngineView):
     def createWindow(self, _type):
         return self.browser.new_tab(blank=True, opener=self)
 
-    def snap(self):
-        """Remember what the page looks like for the tab hover preview. Only possible while it is on screen."""
+    def snap(self, force=True):
+        """Remember what the page looks like for the tab hover preview. Only possible while it is on screen.
+        Grabbing a web view reads the whole frame back from the GPU, so it is skipped when previews are off, and with
+        force=False (the tab-switch path) when a thumbnail from the last couple of seconds already exists."""
         try:
             if self.pending is not None or not self.isVisible() or self.width() < 60 or self.height() < 60:
+                return
+            if not self.browser.settings.get("tab_preview", True):
+                return
+            now = time.monotonic()
+            if not force and self.thumb is not None and now - self.thumb_t < 2.5:
                 return
             pm = self.grab()
             if pm.isNull():
                 return
             pm = pm.scaledToWidth(480, Qt.TransformationMode.SmoothTransformation)
             self.thumb = pm.copy(0, 0, pm.width(), min(pm.height(), 420))
+            self.thumb_t = now
         except RuntimeError:
             pass
 
@@ -10677,7 +11701,7 @@ class TabRow(QWidget):
 # ====================================================================================================
 
 SIDE_DEFAULT_W, SIDE_MIN_W, SIDE_MAX_W = 230, 180, 480
-COMPACT_DEFAULT_W, COMPACT_MIN_W, COMPACT_MAX_W = 56, 50, 140
+COMPACT_DEFAULT_W, COMPACT_MIN_W, COMPACT_MAX_W = 56, 50, 190
 VIZ_BARS = 24
 VIZ_TICK_MS = 25
 VIZ_NEUTRAL = ("#e4edf3", "#9fb3c2")
@@ -13738,11 +14762,11 @@ class EngineButton(FadeButton):
 
 TB_MIME = "application/x-fjord-tbitem"
 TB_ITEMS = {"side": "Sidebar", "back": "Back", "fwd": "Forward", "reload": "Reload", "engine": "Search engine",
-            "speed": "Speed", "vpn": "Privacy shield", "ext": "Extensions", "star": "Bookmark", "site": "Site settings", "scratch": "Scratchpad", "chat": "Chat",
+            "speed": "Speed", "vpn": "Privacy shield", "ext": "Extensions", "star": "Bookmark", "ytdl": "Video download", "site": "Site settings", "scratch": "Scratchpad", "chat": "Chat",
             "tabsearch": "Command palette", "uistyle": "Interface style", "menu": "Menu"}
 TB_GLYPHS = {"side": "sidebar", "back": "back", "fwd": "forward", "reload": "reload", "speed": "speed", "vpn": "shield",
-             "ext": "puzzle", "star": "star", "site": "sliders", "scratch": "scratch", "chat": "chat", "tabsearch": "search", "uistyle": "ui_default", "menu": "dots"}
-TB_DEFAULT = ["side", "back", "fwd", "reload", "addr", "engine", "speed", "vpn", "ext", "star", "site", "scratch", "chat", "tabsearch", "menu"]
+             "ext": "puzzle", "star": "star", "ytdl": "save", "site": "sliders", "scratch": "scratch", "chat": "chat", "tabsearch": "search", "uistyle": "ui_default", "menu": "dots"}
+TB_DEFAULT = ["side", "back", "fwd", "reload", "addr", "engine", "speed", "vpn", "ext", "star", "ytdl", "site", "scratch", "chat", "tabsearch", "menu"]
 TB_FIXED = ("addr", "menu")
 TB_STRETCH = {"addr": 5, "space": 1}
 TB_SIDE_ONLY = ("scratch", "chat", "tabsearch")
@@ -14091,7 +15115,7 @@ class ToolbarEditor(QObject):
         self.seq = 1 + max([int(x.split("#")[1]) for x in self.order if "#" in x] or [0])
         self.widgets = {"addr": win.addr, "side": win.btn_side, "back": win.btn_back, "fwd": win.btn_fwd,
                         "reload": win.btn_reload, "engine": win.btn_engine, "speed": win.btn_speed,
-                        "vpn": win.btn_vpn, "ext": win.btn_ext, "star": win.btn_star, "site": win.btn_site,
+                        "vpn": win.btn_vpn, "ext": win.btn_ext, "star": win.btn_star, "ytdl": win.btn_ytdl, "site": win.btn_site,
                         "scratch": win.scratch_btn, "chat": win.chat_btn, "tabsearch": win.search_btn, "uistyle": win.btn_style, "menu": win.btn_menu}
         if not win.settings.get("tb_tabsearch_seeded"):
             win.settings["tb_tabsearch_seeded"] = True
@@ -14114,6 +15138,14 @@ class ToolbarEditor(QObject):
             if isinstance(win.settings.get("toolbar"), list):
                 at = self.order.index("star") + 1 if "star" in self.order else max(0, len(self.order) - 1)
                 for k, iid in enumerate([i for i in ("site",) if i not in self.order]):
+                    self.order.insert(at + k, iid)
+                win.settings["toolbar"] = list(self.order)
+            jsave("settings.json", win.settings)
+        if not win.settings.get("tb_ytdl_seeded"):
+            win.settings["tb_ytdl_seeded"] = True
+            if isinstance(win.settings.get("toolbar"), list):
+                at = self.order.index("star") + 1 if "star" in self.order else max(0, len(self.order) - 1)
+                for k, iid in enumerate([i for i in ("ytdl",) if i not in self.order]):
                     self.order.insert(at + k, iid)
                 win.settings["toolbar"] = list(self.order)
             jsave("settings.json", win.settings)
@@ -19568,6 +20600,9 @@ class DlItem:
         self.risk = 0
         self.speed = 0.0
         self.last = (0, 0.0)
+        self.job = None
+        self.yt = None
+        self.stage = ""
         self.__dict__.update(kw)
 
     def live(self):
@@ -19697,6 +20732,8 @@ class DlChip(QFrame):
                         sub += " · %s left" % dl_span((tot - got) / it.speed)
             first = ("play", "Resume") if it.state == "paused" else ("pause", "Pause")
             second = ("stop", "Cancel download")
+            if it.job is not None:
+                sub = it.stage or ("Starting\u2026" if it.got <= 0 else sub)
         elif it.state == "failed":
             sub, tone = "Failed · " + (it.err or "interrupted"), "bad"
             first, second = ("reload", "Try again"), ("stop", "Remove from list")
@@ -19718,6 +20755,7 @@ class DlChip(QFrame):
             self.sub.setStyleSheet(css)
         self.title.setText(it.name)
         self.sub.setText(sub)
+        self.b1.setVisible(not (it.live() and it.job is not None))
         for b, (kind, tip) in ((self.b1, first), (self.b2, second)):
             if b.kind != kind:
                 b.kind = kind
@@ -19818,7 +20856,8 @@ class DlChip(QFrame):
             m.addAction("Copy path", lambda: QApplication.clipboard().setText(it.path))
             m.addAction("Copy SHA-256", lambda: s.copy_hash(it))
         if it.live():
-            m.addAction("Resume" if it.state == "paused" else "Pause", lambda: s.toggle_pause(it))
+            if it.job is None:
+                m.addAction("Resume" if it.state == "paused" else "Pause", lambda: s.toggle_pause(it))
             m.addAction("Cancel download", lambda: s.cancel(it))
         elif not here:
             m.addAction("Download again", lambda: s.retry(it))
@@ -19926,7 +20965,8 @@ class DownloadShelf(QFrame):
                 self.items.append(DlItem(id=str(e.get("id") or secrets.token_hex(4)), name=str(e["name"]),
                                          path=str(e["path"]), url=str(e.get("url", "")), ts=float(e.get("ts", 0)),
                                          size=int(e.get("size", 0)), kind=kind, risk=int(e.get("risk", 0)),
-                                         note=str(e.get("note", "")), state="done"))
+                                         note=str(e.get("note", "")), state="done",
+                                         yt=e.get("yt") if isinstance(e.get("yt"), dict) else None))
             except (TypeError, ValueError):
                 continue
         for it in reversed(self.items):
@@ -19934,7 +20974,8 @@ class DownloadShelf(QFrame):
 
     def save(self):
         jsave(DL_FILE, [{"id": i.id, "name": i.name, "path": i.path, "url": i.url, "ts": i.ts, "size": i.size,
-                         "kind": i.kind, "risk": i.risk, "note": i.note} for i in self.items if i.state == "done"][:DL_SHOW])
+                         "kind": i.kind, "risk": i.risk, "note": i.note, "yt": i.yt}
+                        for i in self.items if i.state == "done"][:DL_SHOW])
 
     def _chip(self, it):
         chip = DlChip(self, it)
@@ -19993,6 +21034,60 @@ class DownloadShelf(QFrame):
         self._summary()
         self._arm()
         return it
+
+    def add_job(self, job, title, url, opt):
+        """Show a yt-dlp video download on the shelf, with the same progress bar, cancel and open buttons as any other download."""
+        audio = bool(opt.get("audio"))
+        ext = opt.get("ext") or ("m4a" if audio else "mp4")
+        name = safe_name(title or "video", "video") + "." + ext
+        slim = {k: opt[k] for k in ("key", "label", "sel", "audio", "mp3", "ext", "size") if k in opt}
+        it = DlItem(job=job, name=name, url=url, kind="audio" if audio else "video", total=int(opt.get("size") or 0),
+                    yt={"url": url, "title": title or "", "opt": slim})
+        self.items.insert(0, it)
+        self._chip(it)
+        while len(self.items) > DL_SHOW:
+            old = next((i for i in reversed(self.items) if not i.live()), None)
+            if old is None:
+                break
+            self._drop(old)
+        job.progress.connect(lambda got, tot, sp, stage, i=it: self._job_progress(i, got, tot, sp, stage))
+        job.ended.connect(lambda ok, path, err, i=it: self._job_done(i, ok, path, err))
+        self.tick.start()
+        if not self.suppressed:
+            self.set_open(True)
+        self._summary()
+        self._arm()
+        return it
+
+    def _job_progress(self, it, got, total, speed, stage):
+        if it not in self.items:
+            return
+        it.got, it.speed, it.stage = int(got), float(speed), stage
+        if total > 0:
+            it.total = int(total)
+        chip = self.chips.get(it.id)
+        if chip is not None:
+            chip.sync()
+        self._summary()
+
+    def _job_done(self, it, ok, path, err):
+        it.job, it.speed, it.stage = None, 0.0, ""
+        if it not in self.items:
+            return
+        if ok:
+            it.state, it.path, it.name = "done", path, os.path.basename(path)
+            if dl_kind(it.name) != "other":
+                it.kind = dl_kind(it.name)
+            try:
+                it.size = os.path.getsize(path)
+            except OSError:
+                it.size = 0
+            it.risk, it.note, it.ts = 0, "", time.time()
+            self.save()
+            self.b.toast("Saved %s" % it.name, 4000)
+        else:
+            it.state, it.err = "failed", err
+        self._refresh(it)
 
     def _state(self, it):
         req = it.req
@@ -20083,6 +21178,9 @@ class DownloadShelf(QFrame):
         self.empty.setVisible(not self.items)
 
     def toggle_pause(self, it):
+        if it.job is not None:
+            self.pin()
+            return
         try:
             if it.req is not None:
                 it.req.resume() if it.state == "paused" else it.req.pause()
@@ -20091,6 +21189,9 @@ class DownloadShelf(QFrame):
         self.pin()
 
     def cancel(self, it):
+        if it.job is not None:
+            it.job.cancel()
+            it.job = None
         try:
             if it.req is not None:
                 it.req.cancel()
@@ -20115,8 +21216,11 @@ class DownloadShelf(QFrame):
         self._arm()
 
     def retry(self, it):
-        url = it.url
+        url, yt = it.url, it.yt
         self.remove(it)
+        if yt and yt.get("url") and isinstance(yt.get("opt"), dict):
+            self.b.ytdl.start(yt["url"], yt.get("title", ""), yt["opt"])
+            return
         t = self.b.cur()
         if url and t is not None:
             t.page().download(QUrl(url))
@@ -20300,65 +21404,802 @@ class DownloadShelf(QFrame):
 
 
 # ====================================================================================================
+# 49B  YOUTUBE VIDEO DOWNLOADER
+# ====================================================================================================
+
+YT_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+YT_ID = re.compile(r"^[\w-]{11}$")
+YT_INFO_TTL = 600
+YT_INFO_CACHE = {}
+YT_FORMAT_KEYS = ("vcodec", "acodec", "height", "width", "fps", "filesize", "filesize_approx", "abr", "tbr", "ext")
+
+
+def yt_video_url(url):
+    """The clean watch link for a YouTube video page (no playlist or tracking bits), or '' if this isn't a video page."""
+    try:
+        u = urlparse(url.toString() if isinstance(url, QUrl) else str(url))
+    except ValueError:
+        return ""
+    if u.scheme not in ("http", "https"):
+        return ""
+    host = (u.hostname or "").lower()
+    if not any(host == h or host.endswith("." + h) for h in YT_HOSTS):
+        return ""
+    parts = [p for p in u.path.split("/") if p]
+    vid = ""
+    if host == "youtu.be" or host.endswith(".youtu.be"):
+        vid = parts[0] if parts else ""
+    elif parts and parts[0] == "watch":
+        vid = (parse_qs(u.query).get("v") or [""])[0]
+    elif len(parts) >= 2 and parts[0] in ("shorts", "live", "embed", "v"):
+        vid = parts[1]
+    return "https://www.youtube.com/watch?v=" + vid if YT_ID.match(vid) else ""
+
+
+def yt_install_hint(what):
+    """The one-line command that installs ffmpeg or Deno on this computer."""
+    win, mac = sys.platform == "win32", sys.platform == "darwin"
+    if what == "ffmpeg":
+        return "winget install ffmpeg" if win else "brew install ffmpeg" if mac else "sudo apt install ffmpeg"
+    return "winget install DenoLand.Deno" if win else "brew install deno" if mac else "curl -fsSL https://deno.land/install.sh | sh"
+
+
+def yt_tool():
+    """How to run yt-dlp, as a command list: the Python package in this interpreter first (Fjord can update that one itself),
+    then a yt-dlp program on PATH or in Fjord's own folder. None if it isn't installed."""
+    if not getattr(sys, "frozen", False) and sys.executable:
+        try:
+            import importlib.util
+            if importlib.util.find_spec("yt_dlp") is not None:
+                return [sys.executable, "-m", "yt_dlp"]
+        except (ImportError, ValueError):
+            pass
+    exe = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
+    if not exe:
+        for n in ("yt-dlp.exe", "yt-dlp"):
+            f = REAL_DATA_DIR / "bin" / n
+            if f.is_file():
+                exe = str(f)
+                break
+    return [exe] if exe else None
+
+
+def yt_has_js():
+    """YouTube now needs a JavaScript runtime on the computer for yt-dlp to unscramble its video links."""
+    return bool(shutil.which("deno") or shutil.which("node"))
+
+
+def yt_js_args():
+    """yt-dlp finds Deno by itself; if only Node is installed it has to be pointed there."""
+    if shutil.which("deno"):
+        return []
+    return ["--js-runtimes", "node"] if shutil.which("node") else []
+
+
+def yt_proc(parent):
+    """A QProcess set up for yt-dlp: UTF-8 output, and no black console window flashing up on Windows."""
+    p = QProcess(parent)
+    env = QProcessEnvironment.systemEnvironment()
+    env.insert("PYTHONIOENCODING", "utf-8")
+    env.insert("PYTHONUTF8", "1")
+    p.setProcessEnvironment(env)
+    if sys.platform == "win32":
+        try:
+            p.setCreateProcessArgumentsModifier(lambda a: setattr(a, "flags", a.flags | 0x08000000))
+        except Exception:
+            pass
+    return p
+
+
+def yt_num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def yt_options(info, have_ffmpeg):
+    """The choices to offer for a video, built from yt-dlp's format list: one row per picture quality, then audio-only rows.
+    Without ffmpeg only ready-made files that already hold picture and sound can be offered, because YouTube keeps HD
+    video and audio apart and ffmpeg is what joins them (and what makes MP3s)."""
+    fmts = [f for f in (info.get("formats") or []) if isinstance(f, dict)]
+
+    def has(f, k):
+        return (f.get(k) or "none") != "none"
+
+    def size(f):
+        return int(yt_num(f.get("filesize")) or yt_num(f.get("filesize_approx")))
+
+    video = [f for f in fmts if has(f, "vcodec") and yt_num(f.get("height")) >= 144]
+    audio = [f for f in fmts if has(f, "acodec") and not has(f, "vcodec")]
+    best_audio = max(audio, key=lambda f: (yt_num(f.get("abr")), size(f)), default=None)
+    pool = video if have_ffmpeg else [f for f in video if has(f, "acodec")]
+    out = []
+    for h in sorted({int(yt_num(f["height"])) for f in pool}, reverse=True)[:6]:
+        group = [f for f in pool if int(yt_num(f["height"])) == h]
+        best = max(group, key=lambda f: (str(f.get("vcodec") or "").startswith("avc1"), yt_num(f.get("tbr"))))
+        sz = size(best) + (size(best_audio) if best_audio is not None and not has(best, "acodec") else 0)
+        bits = ["MP4" if have_ffmpeg else str(best.get("ext") or "mp4").upper()]
+        w = int(yt_num(best.get("width")))
+        if w:
+            bits.append("%d\u00d7%d" % (w, h))
+        fps = yt_num(best.get("fps"))
+        if fps > 30:
+            bits.append("%d fps" % round(fps))
+        if sz:
+            bits.append("~" + human_size(sz))
+        if have_ffmpeg:
+            sel = "bv*[height=%d][vcodec^=avc1]+ba[ext=m4a]/bv*[height=%d]+ba/b[height<=%d]" % (h, h, h)
+        else:
+            sel = "b[height=%d]/b[height<=%d]" % (h, h)
+        out.append({"key": "v%d" % h, "label": "%dp" % h + (" \u00b7 4K" if h >= 2160 else " \u00b7 HD" if h >= 720 else ""),
+                    "desc": " \u00b7 ".join(bits), "sel": sel, "audio": False, "mp3": False, "size": sz,
+                    "ext": "mp4" if have_ffmpeg else str(best.get("ext") or "mp4")})
+    asz = size(best_audio) if best_audio is not None else 0
+    tail = (" \u00b7 ~" + human_size(asz)) if asz else ""
+    if have_ffmpeg and (audio or video):
+        out.append({"key": "amp3", "label": "Audio \u00b7 MP3", "desc": "Converted, best quality" + tail,
+                    "sel": "ba/b", "audio": True, "mp3": True, "size": asz, "ext": "mp3"})
+    if audio:
+        m4a = any(f.get("ext") == "m4a" for f in audio)
+        out.append({"key": "aorig", "label": "Audio \u00b7 M4A" if m4a else "Audio only",
+                    "desc": "Original quality, no conversion" + tail,
+                    "sel": "ba[ext=m4a]/ba" if m4a else "ba", "audio": True, "mp3": False, "size": asz,
+                    "ext": "m4a" if m4a else str(best_audio.get("ext") or "webm")})
+    return out
+
+
+class YtLookup(QObject):
+    """Asks yt-dlp what a video is called and which qualities it comes in. Nothing is downloaded."""
+    done = pyqtSignal(dict, str)
+
+    def __init__(self, mgr, url):
+        super().__init__(mgr)
+        self._out, self._err, self._sent, self._dead = b"", b"", False, False
+        self.proc = yt_proc(self)
+        self.proc.readyReadStandardOutput.connect(self._read_out)
+        self.proc.readyReadStandardError.connect(self._read_err)
+        self.proc.finished.connect(self._finished)
+        self.proc.errorOccurred.connect(self._failed)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self._timeout)
+        cmd = mgr.tool() + yt_js_args() + ["-J", "--no-playlist", "--no-warnings", url]
+        self.timer.start(75000)
+        self.proc.start(cmd[0], cmd[1:])
+
+    def _read_out(self):
+        self._out += bytes(self.proc.readAllStandardOutput())
+
+    def _read_err(self):
+        self._err += bytes(self.proc.readAllStandardError())
+
+    def _emit(self, info, err):
+        if self._sent or self._dead:
+            return
+        self._sent = True
+        self.timer.stop()
+        self.done.emit(info, err)
+
+    def _finished(self, code, _status):
+        self._read_out()
+        self._read_err()
+        info = {}
+        try:
+            info = json.loads(self._out.decode("utf-8", "replace"))
+        except ValueError:
+            pass
+        if code == 0 and isinstance(info, dict) and info.get("formats"):
+            self._emit(info, "")
+            return
+        lines = [l.strip() for l in self._err.decode("utf-8", "replace").splitlines() if l.strip()]
+        errs = [l for l in lines if l.startswith("ERROR")]
+        msg = (errs or lines or ["yt-dlp stopped without an answer (code %s)" % code])[-1]
+        self._emit({}, re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*[\w-]*:\s*)?", "", msg))
+
+    def _failed(self, err):
+        if err == QProcess.ProcessError.FailedToStart:
+            self._emit({}, "Couldn't start yt-dlp")
+
+    def _timeout(self):
+        self.cancel()
+        self._dead = False
+        self._emit({}, "yt-dlp took too long to answer. Check your connection and try again.")
+
+    def cancel(self):
+        self._dead = True
+        self.timer.stop()
+        try:
+            if self.proc.state() != QProcess.ProcessState.NotRunning:
+                self.proc.kill()
+        except RuntimeError:
+            pass
+
+
+class YtJob(QObject):
+    """One yt-dlp download. Works in a private temp folder (so a cancelled download leaves nothing behind), reports progress
+    across the video and audio streams as one bar, and hands back the finished file's path."""
+    progress = pyqtSignal(float, float, float, str)    # got, total, speed, stage
+    ended = pyqtSignal(bool, str, str)                 # ok, path, error
+
+    def __init__(self, mgr, url, opt, folder):
+        super().__init__(mgr)
+        self.cancelled = False
+        self.folder, self.t0 = folder, time.time()
+        self.tmp = tempfile.mkdtemp(prefix="fjord_yt_")
+        self._buf, self._path, self._err = "", "", ""
+        self._done_bytes, self._expect, self._emit_t = 0.0, float(opt.get("size") or 0), 0.0
+        self.proc = yt_proc(self)
+        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self._read)
+        self.proc.finished.connect(self._finished)
+        self.proc.errorOccurred.connect(self._failed)
+        ff = mgr.ffmpeg()
+        cmd = mgr.tool() + yt_js_args() + [
+            "-f", opt["sel"], "--no-playlist", "--newline", "--progress", "-N", "4",
+            "-P", folder, "-P", "temp:" + self.tmp, "-o", "%(title).80s.%(ext)s",
+            "--progress-template", "download:FJP|%(progress.status)s|%(progress.downloaded_bytes)s|"
+                                   "%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s",
+            "--print", "after_move:FJDONE|%(filepath)s"]
+        if opt.get("audio"):
+            if opt.get("mp3"):
+                cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
+        elif ff:
+            cmd += ["--merge-output-format", "mp4"]
+        if ff:
+            cmd.append("--embed-metadata")
+        self.cmd = cmd + [url]
+
+    def start(self):
+        self.proc.start(self.cmd[0], self.cmd[1:])
+
+    def _read(self):
+        self._buf += bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
+        parts = re.split(r"[\r\n]+", self._buf)
+        self._buf = parts.pop()
+        for ln in parts:
+            self._line(ln.strip())
+
+    def _line(self, ln):
+        if ln.startswith("FJP|"):
+            f = ln.split("|")
+            status = f[1] if len(f) > 1 else ""
+            num = lambda i: yt_num(f[i]) if len(f) > i else 0.0
+            got, tot, est, sp = num(2), num(3), num(4), num(5)
+            tot = tot or est
+            now = time.time()
+            if status == "finished":
+                self._done_bytes += max(got, tot)
+                self.progress.emit(self._done_bytes, max(self._expect, self._done_bytes), 0.0, "")
+                return
+            if now - self._emit_t < 0.2:
+                return
+            self._emit_t = now
+            have = self._done_bytes + got
+            total = max(self._expect, self._done_bytes + tot, have)
+            self.progress.emit(have, total, sp, "")
+        elif ln.startswith("FJDONE|"):
+            self._path = ln[7:].strip()
+        elif ln.startswith("[Merger]"):
+            self._stage("Merging video and audio\u2026")
+        elif ln.startswith("[ExtractAudio]"):
+            self._stage("Converting audio\u2026")
+        elif ln.startswith(("[VideoRemuxer]", "[VideoConvertor]", "[Metadata]", "[EmbedThumbnail]", "[Fixup")):
+            self._stage("Finishing up\u2026")
+        elif ln.startswith("ERROR"):
+            self._err = ln
+
+    def _stage(self, text):
+        total = max(self._expect, self._done_bytes)
+        self.progress.emit(total, total, 0.0, text)
+
+    def _short_err(self, code):
+        msg = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*[\w-]*:\s*)?", "", self._err).strip()
+        if "ffmpeg" in msg.lower() or "ffprobe" in msg.lower():
+            return "ffmpeg is needed for this format (%s)" % yt_install_hint("ffmpeg")
+        return msg[:140] or "yt-dlp stopped (code %s)" % code
+
+    def _newest_file(self):
+        """Fallback when the printed path got mangled by the console's text encoding: the newest finished file in the folder."""
+        try:
+            files = [p for p in Path(self.folder).iterdir() if p.is_file() and not p.name.endswith((".part", ".ytdl", ".temp"))
+                     and p.stat().st_mtime >= self.t0 - 2]
+            return str(max(files, key=lambda p: p.stat().st_mtime)) if files else ""
+        except OSError:
+            return ""
+
+    def _finished(self, code, _status):
+        self._read()
+        if self._buf.strip():
+            self._line(self._buf.strip())
+            self._buf = ""
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        if self.cancelled:
+            return
+        path = self._path if self._path and os.path.exists(self._path) else (self._newest_file() if code == 0 else "")
+        if code == 0 and path:
+            self.ended.emit(True, path, "")
+        else:
+            self.ended.emit(False, "", self._short_err(code))
+
+    def _failed(self, err):
+        if err == QProcess.ProcessError.FailedToStart and not self.cancelled:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+            self.ended.emit(False, "", "Couldn't start yt-dlp")
+
+    def cancel(self):
+        self.cancelled = True
+        try:
+            if self.proc.state() != QProcess.ProcessState.NotRunning:
+                self.proc.kill()
+            else:
+                shutil.rmtree(self.tmp, ignore_errors=True)
+        except RuntimeError:
+            pass
+
+
+class YtDownloads(QObject):
+    """Owns everything video-download related for a window: finds yt-dlp and ffmpeg, runs lookups and downloads, and installs or
+    updates yt-dlp when the person asks."""
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.jobs = []
+        self.installer = None
+        self._inst_out = b""
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.kill_all)
+
+    def tool(self):
+        return yt_tool()
+
+    @staticmethod
+    def ffmpeg():
+        return bool(shutil.which("ffmpeg"))
+
+    def lookup(self, url):
+        return YtLookup(self, url)
+
+    def folder_for(self, kind):
+        base = Path.home() / "Downloads"
+        sub = DL_TYPES[kind][1]
+        folder = base / sub if (self.win.settings.get("dl_sort", False) and sub) else base
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            folder = base
+            base.mkdir(exist_ok=True)
+        return folder
+
+    def start(self, url, title, opt):
+        if not self.tool():
+            self.win.toast("yt-dlp isn't installed yet. Click the download button and choose Install.", 5000)
+            return None
+        folder = self.folder_for("audio" if opt.get("audio") else "video")
+        job = YtJob(self, url, opt, str(folder))
+        self.jobs.append(job)
+        job.ended.connect(lambda *_a, j=job: self._forget(j))
+        self.win.dlshelf.add_job(job, title, url, opt)
+        job.start()
+        return job
+
+    def _forget(self, job):
+        if job in self.jobs:
+            self.jobs.remove(job)
+        job.deleteLater()
+
+    def kill_all(self):
+        for j in list(self.jobs):
+            j.cancel()
+
+    def installing(self):
+        return self.installer is not None
+
+    def install(self, update=False):
+        """Install (or update) yt-dlp. Runs in the background; the result shows as a message at the bottom of the window."""
+        if self.installer is not None:
+            return
+        tool = self.tool()
+        standalone = bool(tool) and tool[0] != sys.executable
+        if standalone:
+            cmd = tool + ["-U"]
+        elif getattr(sys, "frozen", False) or not sys.executable:
+            self.win.toast("Please install yt-dlp yourself:  pip install -U \"yt-dlp[default]\"", 9000)
+            return
+        else:
+            cmd = [sys.executable, "-m", "pip", "install", "-U", "yt-dlp[default]"]
+        p = yt_proc(self)
+        p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self._inst_out = b""
+        p.readyReadStandardOutput.connect(lambda: setattr(self, "_inst_out", (self._inst_out + bytes(p.readAllStandardOutput()))[-4000:]))
+        p.finished.connect(lambda code, _s: self._installed(code, update))
+        p.errorOccurred.connect(lambda err: self._installed(-1, update) if err == QProcess.ProcessError.FailedToStart else None)
+        self.installer = p
+        self.win.toast(("Updating" if update else "Installing") + " yt-dlp\u2026 this takes a few seconds", 120000)
+        p.start(cmd[0], cmd[1:])
+
+    def _installed(self, code, update):
+        p, self.installer = self.installer, None
+        if p is None:
+            return
+        p.deleteLater()
+        if code == 0:
+            try:
+                import importlib
+                importlib.invalidate_caches()
+            except Exception:
+                pass
+            YT_INFO_CACHE.clear()
+            self.win.toast("yt-dlp is ready. Click the download button again.", 6000)
+        else:
+            tail = self._inst_out.decode("utf-8", "replace").strip().splitlines()
+            if any("externally-managed" in l for l in tail):
+                why = "your Python is managed by the system. Try:  pipx install yt-dlp"
+            else:
+                why = "run  pip install -U \"yt-dlp[default]\"  in a terminal, then try again"
+            self.win.toast("Couldn't %s yt-dlp automatically: %s" % ("update" if update else "install", why), 12000)
+
+
+class YtRow(SpeedRow):
+    """One quality choice in the video download popup. Same look as the speed popup's rows."""
+    class _Kinds:
+        @staticmethod
+        def get(key, default=None):
+            return "music" if str(key).startswith("a") else "play"
+    KIND = _Kinds()
+    TINT = {}
+
+    def __init__(self, opt):
+        super().__init__(opt["key"], {"label": opt["label"], "desc": opt["desc"]}, False)
+        self.opt = opt
+        self.setFixedHeight(48)
+
+
+class VideoDownloadPopup(GlassPopup):
+    """Popup under the toolbar's download button: it looks up the video, lists the qualities and audio formats it comes in,
+    and the one you click starts downloading onto the download shelf."""
+    GUARD = "_ytpop_closed"
+
+    def __init__(self, win, url, page_title=""):
+        super().__init__(win)
+        self.url, self.anchor, self.title = url, None, page_title
+        self._picked, self.rows, self.job = False, [], None
+        self.setObjectName("privdash")
+        self.setFixedWidth(360)
+        self.setStyleSheet(themed(PrivacyDashboard._qss()))
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(8)
+        t = QLabel("~/download" if term_on() else "Download video")
+        t.setObjectName("hd")
+        self.sub = QLabel()
+        self.sub.setObjectName("sub")
+        self.sub.setWordWrap(True)
+        lay.addWidget(t)
+        lay.addWidget(self.sub)
+        self.box = QVBoxLayout()
+        self.box.setSpacing(6)
+        lay.addLayout(self.box)
+        self.foot = QLabel()
+        self.foot.setObjectName("sub")
+        self.foot.setWordWrap(True)
+        self.foot.hide()
+        lay.addWidget(self.foot)
+        self.btns = QHBoxLayout()
+        self.btns.setSpacing(8)
+        lay.addLayout(self.btns)
+        self._begin()
+
+    # -- layout helpers -------------------------------------------------------------------------
+
+    def show_under(self, button):
+        self.anchor = button
+        self._place()
+        self.show()
+
+    def _place(self):
+        self.adjustSize()
+        b = self.anchor
+        if b is None:
+            return
+        pos = b.mapToGlobal(b.rect().bottomLeft()) + QPoint(0, 6)
+        scr = b.screen().availableGeometry()
+        pos.setX(max(scr.left() + 8, min(pos.x(), scr.right() - self.width() - 8)))
+        pos.setY(max(scr.top() + 8, min(pos.y(), scr.bottom() - self.height() - 8)))
+        self.move(pos)
+
+    def _note(self, text):
+        self.foot.setText(text)
+        self.foot.setVisible(bool(text))
+
+    def _actions(self, *pairs):
+        while self.btns.count():
+            w = self.btns.takeAt(0).widget()
+            if w is not None:
+                w.deleteLater()
+        for label, fn in pairs:
+            b = QPushButton(label)
+            b.setObjectName("pbtn")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, f=fn: f())
+            self.btns.addWidget(b)
+        if pairs:
+            self.btns.addStretch(1)
+
+    def _clear_rows(self):
+        for r in self.rows:
+            self.box.removeWidget(r)
+            r.hide()
+            r.deleteLater()
+        self.rows = []
+
+    def _set_title(self, text):
+        self.sub.setText(QFontMetrics(self.sub.font()).elidedText(text, Qt.TextElideMode.ElideRight, 320) if text else "")
+
+    # -- the three states: needs yt-dlp, looking up, ready / failed -----------------------------------
+
+    def _begin(self):
+        mgr = self.win.ytdl
+        self._clear_rows()
+        self._actions()
+        self._note("")
+        if mgr.installing():
+            self.sub.setText("yt-dlp is being installed. Try again in a moment.")
+            return
+        if not mgr.tool():
+            self.sub.setText("Fjord saves videos with yt-dlp, a free open-source tool. It isn't installed yet.")
+            self._actions(("Install yt-dlp", lambda: self._install(False)))
+            return
+        hit = YT_INFO_CACHE.get(self.url)
+        if hit and time.time() - hit[0] < YT_INFO_TTL:
+            self._ready(hit[1])
+            return
+        self.sub.setText("Looking up formats\u2026")
+        self.job = mgr.lookup(self.url)
+        self.job.done.connect(self._looked)
+
+    def _looked(self, info, err):
+        self.job = None
+        if err or not info:
+            self._fail(err or "Couldn't read this video.")
+            return
+        slim = {"title": info.get("title") or "",
+                "formats": [{k: f.get(k) for k in YT_FORMAT_KEYS} for f in (info.get("formats") or []) if isinstance(f, dict)]}
+        if len(YT_INFO_CACHE) > 12:
+            YT_INFO_CACHE.pop(next(iter(YT_INFO_CACHE)))
+        YT_INFO_CACHE[self.url] = (time.time(), slim)
+        self._ready(slim)
+
+    def _ready(self, info):
+        mgr = self.win.ytdl
+        opts = yt_options(info, mgr.ffmpeg())
+        self.title = info.get("title") or self.title
+        self._set_title(self.title)
+        if not opts:
+            self._fail("No downloadable formats were found for this video.")
+            return
+        for o in opts:
+            row = YtRow(o)
+            row.clicked.connect(lambda _c=False, op=o: self._pick(op))
+            self.box.addWidget(row)
+            self.rows.append(row)
+        notes = []
+        if not mgr.ffmpeg():
+            notes.append("Install ffmpeg (%s) and restart Fjord to unlock HD and MP3." % yt_install_hint("ffmpeg"))
+        if not yt_has_js():
+            notes.append("No JavaScript runtime found, so some qualities may be missing. Install Deno (%s)." % yt_install_hint("deno"))
+        self._note("\n".join(notes))
+        self._place()
+
+    def _fail(self, msg):
+        low = msg.lower()
+        self.sub.setText(msg[:220])
+        youtube_side = any(k in low for k in ("not available", "sign in", "javascript", "nsig", "signature", "403",
+                                              "requested format", "unable to extract", "no supported"))
+        if youtube_side and not yt_has_js():
+            self._note("YouTube now needs a JavaScript runtime for this. Install Deno (%s), restart Fjord and try again." % yt_install_hint("deno"))
+        elif youtube_side:
+            self._note("YouTube changes often, so updating yt-dlp usually fixes this.")
+        self._actions(("Update yt-dlp", lambda: self._install(True)), ("Try again", self._retry))
+        self._place()
+
+    def _retry(self):
+        self._begin()
+        self._place()
+
+    def _install(self, update):
+        self.win.ytdl.install(update)
+        self.close()
+
+    def _pick(self, opt):
+        if self._picked:
+            return
+        self._picked = True
+        for r in self.rows:
+            r.set_selected(r.opt["key"] == opt["key"])
+        self.win.ytdl.start(self.url, self.title, opt)
+
+        def done():
+            try:
+                self.close()
+            except RuntimeError:
+                pass
+        QTimer.singleShot(260, done)
+
+    def _before_close(self):
+        if self.job is not None:
+            self.job.cancel()
+            self.job = None
+
+
+# ====================================================================================================
 # 50  NOTIFICATION BARS: PASSWORDS, DEFAULT BROWSER, PERMISSIONS
 # ====================================================================================================
 
 class SavePasswordBar(QFrame):
-    """A small, auto-dismissing 'Save password?' prompt shown after a login form is submitted. Deciding "Save" is the
-    only moment this ever touches the vault; the plaintext password it's holding came from this one page submission
-    and is dropped (never written anywhere) the moment the bar closes without being saved."""
-    def __init__(self, browser, host, user, pw):
+    """The password prompt, built to look and move exactly like the site-permission prompt (same chip icon, pill buttons,
+    per-style colours and glide-in) and sitting in the same stack in the top-right corner. It has two modes:
+
+      "save"  a login was just keyed in and submitted: Save / Never / dismiss. The plaintext password it holds came from that one
+              submission and is dropped (never written anywhere) the moment the bar closes without being saved.
+      "fill"  a login field was just clicked into on a site that has a saved login: Fill / dismiss. The bar never holds the saved
+              password itself, only the list of matching entries, and nothing reaches the page until Fill is pressed.
+
+    Private windows never show either; the vault itself refuses to write anything there."""
+    def __init__(self, browser, host, user, pw, mode="save", tab=None, matches=None):
         super().__init__(browser)
         self.browser, self.host, self.user, self.pw = browser, host, user, pw
-        self.setStyleSheet(
-            "SavePasswordBar{background:#15222d;border:1px solid rgba(255,255,255,.12);border-radius:14px;}"
-            "QLabel{color:#e6eff6;font-size:13px;background:transparent;}"
-            "QPushButton{padding:6px 14px;border:none;border-radius:99px;background:rgba(255,255,255,.08);color:#e6eff6;font-size:12px;}"
-            "QPushButton:hover{background:rgba(255,255,255,.16);}"
-            "QPushButton#save{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #4fb0e8,stop:1 #7ef0d0);color:#0b141d;font-weight:600;}")
+        self.mode, self.tab, self.matches = mode, tab, matches
+        self._leaving = False
+        self._update = False
+        ui = "term" if term_on() else UI["mode"]
+        css = themed(perm_bar_css(ui).replace("PermissionBar{", "SavePasswordBar{", 1))
+        css = (css.replace("@BAR@", "%dpx" % PERM_BAR_R[ui]).replace("@BTN@", "%dpx" % (PERM_BTN_H // 2))
+                  .replace("@CHIP@", "%dpx" % (PERM_CHIP // 2)))
+        self.setStyleSheet(css)
+        self.setFixedHeight(PERM_BAR_H)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(16, 10, 10, 10)
+        m = (PERM_BAR_H - PERM_CHIP) // 2
+        lay.setContentsMargins(m, m, (PERM_BAR_H - PERM_BTN_H) // 2, m)
         lay.setSpacing(8)
-        lay.addWidget(QLabel("Save password for %s%s?" % (host, (" (" + user + ")") if user else "")))
+        chip = QFrame()
+        chip.setObjectName("chip")
+        chip.setFixedSize(PERM_CHIP, PERM_CHIP)
+        cl = QHBoxLayout(chip)
+        cl.setContentsMargins(0, 0, 0, 0)
+        if ui == "term":
+            icon = QLabel("*")
+            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon.setStyleSheet("color:#2bff6a;font-weight:700;background:transparent;border:none;")
+        else:
+            icon = PermIcon("key")
+        cl.addWidget(icon, 0, Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(chip)
+        self._ui = ui
+        self.label = QLabel()
+        self.label.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(self.label)
         lay.addStretch(1)
-        b_never, b_skip, b_save = QPushButton("Never for this site"), QPushButton("Not now"), QPushButton("Save")
-        b_save.setObjectName("save")
-        b_never.clicked.connect(self._never)
-        b_skip.clicked.connect(self.close_now)
-        b_save.clicked.connect(self._save)
-        for btn in (b_never, b_skip, b_save):
+        self.b_x, self.b_never, self.b_go = QPushButton("\u2715"), QPushButton("Never"), QPushButton("Save")
+        self.b_x.setObjectName("x")
+        self.b_never.setObjectName("block")
+        self.b_go.setObjectName("save")
+        self.b_x.setFixedSize(PERM_BTN_H, PERM_BTN_H)
+        for btn in (self.b_never, self.b_go):
+            btn.setFixedHeight(PERM_BTN_H)
+        self.b_x.clicked.connect(self._dismiss)
+        self.b_never.clicked.connect(self._never)
+        self.b_go.clicked.connect(self._go)
+        for btn in (self.b_x, self.b_never, self.b_go):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             lay.addWidget(btn)
+        self._describe()
         self.adjustSize()
         self.place()
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.close_now)
-        self._timer.start(15000)
+        self._timer.start(30000 if mode == "save" else 20000)
+
+    def _describe(self):
+        def clip(s, n):
+            return s if len(s) <= n else s[:n - 1] + "\u2026"
+        hc = PERM_HOST[self._ui]
+        host = '<span style="color:%s;font-weight:600">%s</span>' % (hc, html.escape(clip(self.host, 30)))
+        user = (" (%s)" % html.escape(clip(self.user, 26))) if self.user else ""
+        if self.mode == "save":
+            v = self.browser.vault
+            self._update = bool(v.exists and not v.locked and any(en.get("username") == self.user for en in v.for_host(self.host)))
+            self.label.setText(("Update the saved password for %s%s?" if self._update else "Save password for %s%s?") % (host, user))
+            self.b_go.setText("Update" if self._update else "Save")
+            self.b_go.setToolTip("Encrypt it on this computer with your master password")
+            self.b_never.setToolTip("Never offer to save passwords for this site")
+            self.b_x.setToolTip("Dismiss")
+        else:
+            if self.matches is None:
+                self.label.setText("Unlock your passwords to fill in %s?" % host)
+                self.b_go.setText("Unlock")
+            elif len(self.matches) == 1:
+                self.label.setText("Fill the saved login for %s%s?" % (host, user))
+                self.b_go.setText("Fill")
+            else:
+                self.label.setText("Fill a saved login for %s?" % host)
+                self.b_go.setText("Choose\u2026")
+            self.b_never.setToolTip("Never offer to fill or save passwords for this site")
+            self.b_go.setToolTip("Fill this page's login fields")
+            self.b_x.setToolTip("Dismiss (won't ask again on this site until you restart)")
+
+    def target(self):
+        below = 56 if getattr(self.browser, "_perm_bar", None) is not None else 0
+        return QPoint(max(12, self.browser.width() - self.width() - 28), 64 + below)
 
     def place(self):
-        below = 56 if getattr(self.browser, "_perm_bar", None) is not None else 0
-        self.move(max(12, self.browser.width() - self.width() - 28), 64 + below)
+        if not self._leaving:
+            self.move(self.target())
 
-    def _save(self):
+    def animate_in(self):
+        """Glide down from just above while fading in, the same entrance the permission prompt makes."""
+        end = self.target()
+        fade_widget(self, 0.0, 1.0, 260)
+        animate(self, b"pos", end - QPoint(0, 18), end, 380)
+
+    # --------------------------------------------------------------------------------------------
+    # Vault access
+    # --------------------------------------------------------------------------------------------
+
+    def _open_vault(self, may_create):
+        """True once the vault is unlocked, asking for the master password (or setting one up) if needed."""
         v = self.browser.vault
         if not v.exists:
+            if not may_create:
+                return False
             pw1, ok1 = QInputDialog.getText(self.browser, "Set up passwords", "Choose a master password:", QLineEdit.EchoMode.Password)
             if not (ok1 and pw1):
-                return self.close_now()
+                return False
             pw2, ok2 = QInputDialog.getText(self.browser, "Set up passwords", "Confirm master password:", QLineEdit.EchoMode.Password)
             if not ok2 or pw1 != pw2:
                 self.browser.toast("Passwords didn't match", 4000)
-                return self.close_now()
+                return False
             v.create(pw1)
-        elif v.locked:
-            mp, ok = QInputDialog.getText(self.browser, "Unlock passwords", "Master password:", QLineEdit.EchoMode.Password)
-            if not (ok and mp and v.unlock(mp)):
-                if ok:
-                    self.browser.toast("Wrong master password", 3000)
+            return True
+        if v.locked:
+            if not ask_unlock(self.browser, v):
+                return False
+        return True
+
+    # --------------------------------------------------------------------------------------------
+    # Buttons
+    # --------------------------------------------------------------------------------------------
+
+    def _go(self):
+        self._timer.stop()
+        if self.mode == "save":
+            if not self._open_vault(True):
                 return self.close_now()
-        v.upsert(self.host, self.user, self.pw)
-        self.browser.toast("Password saved", 2500)
+            self.browser.vault.upsert(self.host, self.user, self.pw)
+            self.browser.toast("Password updated" if self._update else "Password saved", 2500)
+            return self.close_now()
+        tab = self.tab
+        if self.matches is None:
+            if not self._open_vault(False):
+                return self.close_now()
+            self.matches = self.browser.vault.for_host(self.host)
+            if not self.matches:
+                self.browser.toast("No saved password for %s" % self.host, 3000)
+                return self.close_now()
+            if len(self.matches) == 1:
+                self.user = self.matches[0].get("username", "")
+        if len(self.matches) == 1:
+            entry = self.matches[0]   # close_now() clears self.matches, so take the entry first
+            self.close_now()
+            self.browser.fill_from_prompt(tab, entry)
+            return
+        menu = QMenu(self)
+        for en in self.matches:
+            menu.addAction(en.get("username") or "(no username)",
+                           lambda _c=False, en=en: (self.close_now(), self.browser.fill_from_prompt(tab, en)))
+        menu.exec(self.b_go.mapToGlobal(QPoint(0, self.b_go.height() + 4)))
         self.close_now()
 
     def _never(self):
@@ -20369,11 +22210,32 @@ class SavePasswordBar(QFrame):
         jsave("settings.json", st)
         self.close_now()
 
+    def _dismiss(self):
+        if self.mode == "fill":
+            self.browser._fill_skip.add(self.host)
+        self.close_now()
+
     def close_now(self):
-        if self.browser._save_bar is self:
+        if getattr(self.browser, "_save_bar", None) is self:
             self.browser._save_bar = None
-        self.hide()
-        self.deleteLater()
+        if self._leaving:
+            return
+        self._leaving = True
+        self.pw = None
+        self.matches = None
+
+        def gone():
+            try:
+                self.hide()
+                self.deleteLater()
+            except RuntimeError:
+                pass
+        try:
+            fade_widget(self, 1.0, 0.0, 180, done=gone)
+            animate(self, b"pos", self.pos(), self.pos() - QPoint(0, 10), 180)
+        except RuntimeError:
+            gone()
+        self.browser.place_bars()
 
 
 class DefaultBrowserBar(QFrame):
@@ -20490,6 +22352,11 @@ class PermIcon(QWidget):
         elif k == "lock":
             p.drawPolygon(QPolygonF([P(6.5, 3.5), P(6.5, 18), P(10.2, 14.6), P(13, 20.8), P(15.4, 19.7),
                                      P(12.7, 13.6), P(17.8, 13.2)]))
+        elif k == "key":
+            p.drawEllipse(P(8, 16), 3.9, 3.9)
+            p.drawLine(P(10.8, 13.2), P(20.5, 3.5))
+            p.drawLine(P(17.2, 6.8), P(19.8, 9.4))
+            p.drawLine(P(14.4, 9.6), P(16.4, 11.6))
         elif k == "fonts":
             p.drawLine(P(3.5, 19), P(8.5, 5.5))
             p.drawLine(P(8.5, 5.5), P(13.5, 19))
@@ -21105,6 +22972,7 @@ class Browser(QMainWindow):
         self._import_sources = []
         self.vault = PasswordVault()
         self._save_bar = None
+        self._fill_skip = set()
         self._default_bar = None
         self._perm_bar = None
         self._perm_queue = []
@@ -21261,6 +23129,8 @@ class Browser(QMainWindow):
         self.btn_ext = ToolIcon("puzzle", "Extensions", self.show_ext_menu)
         self.btn_star = ToolIcon("star", "Bookmark this page  (Ctrl+D)", self.toggle_bookmark)
         self.btn_site = ToolIcon("sliders", "Site settings", self.show_site_settings)
+        self.btn_ytdl = ToolIcon("save", "Download video  (open a YouTube video first)", self.show_ytdl_menu)
+        self.btn_ytdl.setEnabled(False)
         self.btn_style = ToolIcon("ui_default", "", self.show_style_menu)
         self.btn_style.setFixedSize(30, 30)
         self.update_style_btn()
@@ -21318,6 +23188,7 @@ class Browser(QMainWindow):
         self.scratch_row_lay.setContentsMargins(0, 0, 0, 0)
         self.scratch_row_lay.setSpacing(6)
         self.dlshelf = DownloadShelf(self, root)
+        self.ytdl = YtDownloads(self)
         self.tb_ed = ToolbarEditor(self)
         right.insertWidget(right.indexOf(self.toolbar) + 1, self.tb_ed.panel)
         self.tb_ed.apply()
@@ -21684,7 +23555,9 @@ class Browser(QMainWindow):
     def run_action(self, aid, defer=False):
         """Do one of the actions in ACTIONS. defer=True waits for the event that triggered it to finish (the mouse does this)."""
         def jump(n):
-            self.tabs.setCurrentRow(self.stack.count() - 1 if n == 9 else min(n - 1, self.stack.count() - 1))
+            vis = [k for k in range(self.stack.count()) if not self.stack.widget(k).ess]
+            if vis:
+                self.tabs.setCurrentRow(vis[-1] if n == 9 else vis[min(n - 1, len(vis) - 1)])
 
         def addr_of(t):
             return t.pending if t.pending is not None else t.url()
@@ -21781,8 +23654,9 @@ class Browser(QMainWindow):
     # Tab Lifecycle
     # ------------------------------------------------------------------------------------------------
 
-    def new_tab(self, url=None, blank=False, focus_address=False, background=False, opener=None, lazy=False):
+    def new_tab(self, url=None, blank=False, focus_address=False, background=False, opener=None, lazy=False, ess=None):
         tab = Tab(self.profile, self)
+        tab.ess = ess
         row = TabRow(tab, self.close_tab)
         tab.row = row
         item = QListWidgetItem()
@@ -21790,10 +23664,13 @@ class Browser(QMainWindow):
         self.stack.addWidget(tab)
         self.tabs.addItem(item)
         self.tabs.setItemWidget(item, row)
+        if ess:
+            item.setHidden(True)     # an Essential lives in the Essentials grid, not in the tab list
         row.set_compact(self.compact)
         row.show_mem = bool(self.settings.get("show_ram", True))
-        self.fit_tab_width(220)
-        self.animate_item(item, 0, self.target_extent(), 220)
+        if not ess:
+            self.fit_tab_width(220)
+            self.animate_item(item, 0, self.target_extent(), 220)
         if self.horiz:
             self.queue_refit()
         if UI["mode"] == "mac":
@@ -21803,6 +23680,7 @@ class Browser(QMainWindow):
         tab.titleChanged.connect(lambda t, tb=tab: (tb.row.title.setText(t or "New Tab"), tb.row.setToolTip(t), tb.row._refresh_mem()))
         tab.iconChanged.connect(lambda ic, t=tab: self.on_icon(t, ic))
         tab.urlChanged.connect(lambda _u, t=tab: self.apply_internal_icon(t))
+        tab.urlChanged.connect(lambda _u, t=tab: self.track_essential(t))
         tab.loadFinished.connect(lambda _ok, t=tab: self.apply_internal_icon(t))
         tab.urlChanged.connect(lambda _u, t=tab: self.sync_chrome(t))
         tab.urlChanged.connect(lambda _u, t=tab: self.apply_site_zoom(t))
@@ -21860,11 +23738,15 @@ class Browser(QMainWindow):
         i = self.stack.indexOf(tab)
         if i < 0 or tab.closing:
             return
+        if tab.ess:
+            self.leave_essential(tab)
+            return
         u = tab.url()
         if u.scheme() in ("http", "https"):
             self.closed.append(u.toString())
             del self.closed[:-30]
-        alive = [k for k in range(self.stack.count()) if not self.stack.widget(k).closing]
+        alive = [k for k in range(self.stack.count())
+                 if not self.stack.widget(k).closing and not self.stack.widget(k).ess]
         if len(alive) <= 1:
             tab.setHtml(self.start_page(), START_URL)
             return
@@ -21920,8 +23802,9 @@ class Browser(QMainWindow):
 
     def close_others(self, keep):
         for i in reversed(range(self.stack.count())):
-            if self.stack.widget(i) is not keep:
-                self.close_tab(self.stack.widget(i))
+            w = self.stack.widget(i)
+            if w is not keep and not w.ess:
+                self.close_tab(w)
 
     def tab_menu(self, pos):
         item = self.tabs.itemAt(pos)
@@ -21977,7 +23860,7 @@ class Browser(QMainWindow):
         if 0 <= row < self.stack.count():
             prev = self.stack.currentWidget()
             if prev is not None and not prev.closing:
-                prev.snap()
+                prev.snap(force=False)
             self.stack.setCurrentIndex(row)
             self.tabs.scrollToItem(self.tabs.item(row))
             t = self.cur()
@@ -22011,6 +23894,17 @@ class Browser(QMainWindow):
         if SpeedPopup.recently_closed(self):
             return
         SpeedPopup(self).show_under(self.btn_speed)
+
+    def show_ytdl_menu(self):
+        if VideoDownloadPopup.recently_closed(self):
+            return
+        t = self.cur()
+        url = yt_video_url(t.url()) if t is not None else ""
+        if not url:
+            self.toast("Open a YouTube video first, then click the download button", 4000)
+            return
+        anchor = self.btn_ytdl if self.btn_ytdl.isVisible() else self.addr
+        VideoDownloadPopup(self, url, re.sub(r"\s*-\s*YouTube$", "", t.title() or "")).show_under(anchor)
 
     def set_speed_mode(self, key):
         if key not in SPEED_MODES or key == self.speed_mode:
@@ -22054,7 +23948,7 @@ class Browser(QMainWindow):
         self._sleep_ticks += 1
         mode = SPEED_MODES[self.speed_mode]
         if mode["trim_ticks"] and self._sleep_ticks % mode["trim_ticks"] == 0:
-            trim_memory()
+            trim_memory(deep=self.isMinimized() or not self.isActiveWindow() or os_idle_seconds() > 20)
         if mode["sleep"] is None or not self.settings.get("sleep_tabs", True):
             return
         freeze_s, discard_s = mode["sleep"]
@@ -22077,6 +23971,8 @@ class Browser(QMainWindow):
 
     def update_ram(self):
         """Sample each tab's renderer process and update its label and heat outline."""
+        if self.isMinimized() or not self.isVisible():
+            return
         show = bool(self.settings.get("show_ram", True))
         tabs = self.tab_list()
         if not show:
@@ -22151,7 +24047,7 @@ class Browser(QMainWindow):
         r = self.tabs.currentRow()
         for _ in range(n):
             r = (r + d) % n
-            if self.tab_visible(r):
+            if self.tab_visible(r) or self.stack.widget(r).ess:
                 break
         self.tabs.setCurrentRow(r)
 
@@ -22182,6 +24078,11 @@ class Browser(QMainWindow):
         self.btn_star.set_kind("star_on" if starred else "star")
         self.btn_star.setToolTip("Remove bookmark  (Ctrl+D)" if starred else "Bookmark this page  (Ctrl+D)")
         self.setWindowTitle((tab.title() or "New Tab") + (" — Fjord (Private)" if PRIVATE else " — Fjord"))
+        yt_btn = getattr(self, "btn_ytdl", None)
+        if yt_btn is not None:
+            yt_ok = bool(yt_video_url(u))
+            yt_btn.setEnabled(yt_ok)
+            yt_btn.setToolTip("Download this video\u2026" if yt_ok else "Download video  (open a YouTube video first)")
         self.mark_essentials(u)
 
     def set_loading(self, tab, loading):
@@ -22333,7 +24234,7 @@ class Browser(QMainWindow):
             hdr = self.island_hdr()
             slots, hdrs, seen = 0.0, 0, set()
             for t in self.tab_list():
-                if t.closing:
+                if t.closing or t.ess:
                     continue
                 g = self.group_by_id(t.group) if t.group else None
                 if g is None:
@@ -22424,6 +24325,7 @@ class Browser(QMainWindow):
             self.sidebar_w = max(SIDE_MIN_W, min(cap, int(w)))
             if not self.horiz and self.sidebar_wanted:
                 self.side.setFixedWidth(self.sidebar_w)
+        self.regrid_essentials()
         if save:
             self.save_side_width()
 
@@ -22595,7 +24497,7 @@ class Browser(QMainWindow):
         self.scratch_row.setVisible(not self.horiz)
         if self.horiz:
             for w, k in ((self.ess_wrap, 0), (self.group_wrap, 0), (self.tabs, 0), (self.newtab, 0), (self.strip_fill, 1)):
-                if w is self.newtab:
+                if w is self.newtab or w is self.ess_wrap or w is self.tabs or w is self.group_wrap:
                     self.strip_lay.addWidget(w, k, Qt.AlignmentFlag.AlignVCenter)
                 else:
                     self.strip_lay.addWidget(w, k)
@@ -22716,6 +24618,13 @@ class Browser(QMainWindow):
                       proxy_user="", proxy_pw="")
         elif k in ("compact", "autohide", "ess_startup", "visualizer", "palette_genie", "default_ask", "float_player"):
             st[k] = v == "1"
+        elif k == "ess_rows" and v.isdecimal() and 1 <= int(v) <= 4:
+            st[k] = int(v)
+            QTimer.singleShot(0, self.rebuild_essentials)
+        elif k == "ess_cols" and v.isdecimal() and 1 <= int(v) <= 6:
+            st[k] = int(v)
+            self.fit_ess_width()
+            QTimer.singleShot(0, self.rebuild_essentials)
         elif k == "notes_btn":
             self.set_notes_button(v == "1", toast=False)
         elif k == "focus_mode":
@@ -22965,12 +24874,12 @@ class Browser(QMainWindow):
                 continue
             g = self.group_by_id(t.group) if t.group in first else None
             if g is None:
-                extra, hide, size, grouped = 0, False, self.item_size(ext), 0
+                extra, hide, size, grouped = 0, bool(t.ess), self.item_size(ext), 0
             else:
                 p = self.gprog.get(g["id"], 0.0 if g["collapsed"] else 1.0)
                 extra = hdr if first[g["id"]] == i else 0
                 h = int(round(ext * p))
-                hide, size, grouped = (extra == 0 and h <= 0), self.item_size(h + extra), 1
+                hide, size, grouped = ((extra == 0 and h <= 0) or bool(t.ess)), self.item_size(h + extra), 1
             if item.data(ROLE_EXTRA) != extra:
                 item.setData(ROLE_EXTRA, extra)
             if item.data(ROLE_GROUPED) != grouped:
@@ -23477,15 +25386,26 @@ class Browser(QMainWindow):
             self.show_page("shortcuts", page)
 
     def open_essentials_bg(self):
+        """Give every Essential its own (hidden-from-the-list) tab at startup, resuming at the page you stopped on."""
         if PRIVATE or not self.settings.get("ess_startup", True):
             return
-        have = set()
-        for i in range(self.stack.count()):
-            w = self.stack.widget(i)
-            have.add(self.host_of(w.url() if not w.url().isEmpty() else w.page().requestedUrl()))
+        if not self.settings.get("ess_migrated"):
+            # Older versions opened Essentials as ordinary tabs and saved them in the session: pin those instead of duplicating.
+            self.settings["ess_migrated"] = True
+            jsave("settings.json", self.settings)
+            for e in self.essentials:
+                for w in self.tab_list():
+                    u = w.pending if w.pending is not None else w.url()
+                    if not w.ess and not w.closing and self.host_of(u) == e["host"]:
+                        if u.scheme() in ("http", "https"):
+                            e["last"] = u.toString()
+                        self.pin_essential_tab(w, e["host"])
+                        break
+            jsave("essentials.json", self.essentials)
         for e in self.essentials:
-            if e["host"] not in have:
-                self.new_tab(e["url"], background=True)
+            if self.ess_tab(e["host"]) is None:
+                self.new_tab(e.get("last") or e["url"], background=True, ess=e["host"])
+        self.mark_essentials()
 
     def open_find(self):
         if not self.find.isVisible():
@@ -23679,11 +25599,7 @@ class Browser(QMainWindow):
                 return 0
             v.create(pw1)
         elif v.locked:
-            mp, ok = QInputDialog.getText(self, "Unlock passwords",
-                                          "Enter your master password to import %d saved password(s):" % len(pwds), QLineEdit.EchoMode.Password)
-            if not (ok and mp and v.unlock(mp)):
-                if ok:
-                    self.toast("Wrong master password", 3000)
+            if not ask_unlock(self, v, "Enter your master password to import %d saved password(s):" % len(pwds)):
                 return 0
         added = 0
         for p in pwds:
@@ -23759,9 +25675,7 @@ class Browser(QMainWindow):
                         self.toast("Passwords didn't match", 4000)
         elif host == "pw-unlock":
             if v.exists and v.locked:
-                pw, ok = QInputDialog.getText(self, "Unlock passwords", "Master password:", QLineEdit.EchoMode.Password)
-                if ok and pw and not v.unlock(pw):
-                    self.toast("Wrong master password", 4000)
+                ask_unlock(self, v)
         elif host == "pw-lock":
             v.lock()
         elif host == "pw-change":
@@ -23891,6 +25805,9 @@ class Browser(QMainWindow):
         """The visible tab changed: hide a prompt that belongs to another tab and show one that belongs to this tab."""
         bar = self._perm_bar
         cur = self.cur()
+        sb = self._save_bar
+        if sb is not None and sb.tab is not None and sb.tab is not cur:
+            sb.close_now()
         if bar is not None and (cur is None or bar.item["page"] is not cur.page()):
             bar.close_now()
         self.perm_show_next()
@@ -23926,6 +25843,13 @@ class Browser(QMainWindow):
                 pass
         if self._perm_bar is not None and self._perm_bar.item in gone:
             self._perm_bar.close_now()
+        sb = self._save_bar
+        if sb is not None and sb.mode == "fill" and sb.tab is not None:
+            try:
+                if sb.tab.page() is page:
+                    sb.close_now()
+            except RuntimeError:
+                sb.close_now()
         if gone:
             self.perm_show_next()
 
@@ -24077,6 +26001,16 @@ class Browser(QMainWindow):
     # Autofill & Internal Actions
     # ------------------------------------------------------------------------------------------------
 
+    def _af_log(self, msg):
+        """Autofill trace for debugging: ~/.fjord_browser/autofill.log. Never contains passwords."""
+        if PRIVATE:
+            return
+        try:
+            with open(str(DATA_DIR / "autofill.log"), "a", encoding="utf-8") as f:
+                f.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+        except Exception:
+            pass
+
     def offer_save_password(self, payload, host):
         if PRIVATE or not CRYPTO_OK:
             return
@@ -24097,13 +26031,70 @@ class Browser(QMainWindow):
             existing = [en for en in v.for_host(host) if en.get("username") == user]
             if existing and existing[0].get("password") == pw:
                 return
-        if self._save_bar is not None:
-            self._save_bar.close_now()
+        sb = self._save_bar
+        if sb is not None:
+            if sb.mode == "save" and (sb.host, sb.user, sb.pw) == (host, user, pw):
+                return
+            sb.close_now()
         self._save_bar = SavePasswordBar(self, host, user, pw)
         self._save_bar.show()
+        self._save_bar.raise_()
+        self.place_bars()
+        self._save_bar.animate_in()
+
+    def offer_fill_password(self, tab, host):
+        """A login field on the visible tab was clicked into. If there is (or might be, while the vault is locked) a saved login for
+        the site, offer to fill it. Quiet by design: once per site per session after a dismissal, never while a save offer is up."""
+        if PRIVATE or not CRYPTO_OK:
+            self._af_log("focus: skipped (private=%s crypto=%s)" % (PRIVATE, CRYPTO_OK))
+            return
+        host = self.host_of(QUrl("//" + str(host)))
+        v = self.vault
+        self._af_log("focus: host=%s exists=%s locked=%s skipped=%s is_current=%s never=%s"
+                     % (host, v.exists, v.locked, host in self._fill_skip, tab is self.cur(),
+                        host in set(self.settings.get("pw_never", []))))
+        if (not host or not v.exists or host in self._fill_skip or tab is not self.cur()
+                or host in set(self.settings.get("pw_never", []))):
+            return
+        matches = None
+        if not v.locked:
+            matches = v.for_host(host)
+            self._af_log("focus: %d saved login(s) match %s (vault has %d)" % (len(matches), host, len(v.entries)))
+            if not matches:
+                return
+        sb = self._save_bar
+        if sb is not None:
+            if sb.mode == "save" or sb.tab is tab:
+                return
+            sb.close_now()
+        self._save_bar = SavePasswordBar(self, host, matches[0].get("username", "") if matches and len(matches) == 1 else "",
+                                         None, mode="fill", tab=tab, matches=matches)
+        self._save_bar.show()
+        self._save_bar.raise_()
+        self.place_bars()
+        self._save_bar.animate_in()
+
+    def dismiss_fill_prompt(self, tab):
+        """The person began typing into the password field themselves, so the offer to fill it has done its job."""
+        sb = self._save_bar
+        if sb is not None and sb.mode == "fill" and sb.tab is tab:
+            self._fill_skip.add(sb.host)
+            sb.close_now()
+
+    def fill_from_prompt(self, tab, entry):
+        self._af_log("fill button: tab_ok=%s is_current=%s" % (tab is not None, tab is self.cur()))
+        try:
+            if tab is None or tab is not self.cur():
+                return
+            self._do_autofill(tab, entry)
+        except RuntimeError:
+            pass
 
     def autofill_current(self):
         t = self.cur()
+        self._af_log("shortcut: tab=%s internal=%s crypto=%s private=%s exists=%s locked=%s"
+                     % (t is not None, (self.is_internal(t.url()) if t is not None else None), CRYPTO_OK, PRIVATE,
+                        self.vault.exists, self.vault.locked))
         if t is None or self.is_internal(t.url()):
             return
         if not CRYPTO_OK:
@@ -24117,13 +26108,11 @@ class Browser(QMainWindow):
             self.toast("No saved passwords yet \u2014 open \u22ef > Passwords\u2026 to add one", 4000)
             return
         if v.locked:
-            pw, ok = QInputDialog.getText(self, "Unlock passwords", "Master password:", QLineEdit.EchoMode.Password)
-            if not (ok and pw and v.unlock(pw)):
-                if ok:
-                    self.toast("Wrong master password", 3000)
+            if not ask_unlock(self, v):
                 return
         host = self.host_of(t.url())
         matches = v.for_host(host)
+        self._af_log("shortcut: host=%s matches=%d vault_entries=%d" % (host, len(matches), len(v.entries)))
         if not matches:
             self.toast("No saved password for %s" % host, 3000)
         elif len(matches) == 1:
@@ -24135,9 +26124,37 @@ class Browser(QMainWindow):
             m.exec(QCursor.pos())
 
     def _do_autofill(self, tab, entry):
+        self._af_log("fill: running script (username=%s, password_len=%d)"
+                     % (bool(entry.get("username")), len(entry.get("password") or "")))
         js = PW_FILL_JS % (json.dumps(entry.get("username", "")), json.dumps(entry.get("password", "")))
-        tab.page().runJavaScript(js)
-        self.toast("Autofilled saved password", 2500)
+
+        def done(res):
+            self._af_log("fill: script result=%r" % (res,))
+            try:
+                info = json.loads(res) if isinstance(res, str) else {}
+            except ValueError:
+                info = {}
+            if not entry.get("password"):
+                msg = "The saved login has no password stored"
+            elif info.get("pass") and info.get("ok"):
+                msg = "Autofilled saved password"
+            elif info.get("pass"):
+                msg = "Filled the field, but the page cleared it again"
+            elif info.get("user"):
+                msg = "Filled the username - no password field on this step yet"
+            elif info.get("inputs"):
+                msg = "No login field found on this page"
+            else:
+                msg = "No fields reachable - the login may be in a frame Fjord can't access"
+            try:
+                self.toast(msg, 3500)
+            except RuntimeError:
+                pass
+        try:
+            tab.page().runJavaScript(js, done)
+        except Exception:
+            log_error("autofill")
+            self.toast("Autofill failed", 3000)
 
     def internal_action(self, url):
         if url.host() == "search":
@@ -24841,17 +26858,72 @@ class Browser(QMainWindow):
         if saved and any(e["host"] == host for e in self.essentials):
             QTimer.singleShot(0, self.rebuild_essentials)
 
+    def ess_cols_setting(self):
+        """The column count picked in Settings (before it is trimmed to what fits)."""
+        try:
+            n = int(self.settings.get("ess_cols", 1 if self.compact else 4))
+        except (TypeError, ValueError):
+            n = 1 if self.compact else 4
+        return max(1, min(6, n))
+
+    def ess_rows_setting(self):
+        """Horizontal layout only: how many rows the Essentials are spread over (1 = the old single row)."""
+        try:
+            n = int(self.settings.get("ess_rows", 1))
+        except (TypeError, ValueError):
+            n = 1
+        return max(1, min(4, n))
+
+    def _ess_tile(self):
+        return (34, 30) if self.horiz else ((38, 38) if self.compact else (46, 40))
+
+    def ess_cols(self):
+        """How many columns the grid really uses: the setting, trimmed to what fits in the sidebar."""
+        if self.horiz:
+            n = max(1, len(self.essentials))
+            return max(1, -(-n // min(self.ess_rows_setting(), n)))
+        tw = self._ess_tile()[0]
+        inner = self.side_width() - 20
+        fit = max(1, (inner + 6) // (tw + 6))
+        return max(1, min(self.ess_cols_setting(), fit))
+
+    def fit_ess_width(self):
+        """Widen the sidebar if the chosen number of columns doesn't fit in it."""
+        if self.horiz:
+            return
+        cols = self.ess_cols_setting()
+        need = 20 + cols * self._ess_tile()[0] + (cols - 1) * 6
+        if need > self.side_width():
+            self.set_side_width(need, save=True)
+
+    def regrid_essentials(self):
+        """Re-place the existing tiles when the sidebar is resized and a different number of columns now fits."""
+        if not hasattr(self, "ess_grid") or not self.tiles:
+            return
+        cols = self.ess_cols()
+        if cols == getattr(self, "_ess_cols_used", None):
+            return
+        self._ess_cols_used = cols
+        for n, (b, _e) in enumerate(self.tiles):
+            self.ess_grid.removeWidget(b)
+            self.ess_grid.addWidget(b, *self._ess_pos(n, cols))
+
+    def _ess_pos(self, n, cols):
+        return (n // cols, n % cols)
+
     def rebuild_essentials(self):
         while self.ess_grid.count():
             w = self.ess_grid.takeAt(0).widget()
             if w:
                 w.deleteLater()
         self.tiles = []
+        cols = self.ess_cols()
+        self._ess_cols_used = cols
         for n, e in enumerate(self.essentials):
             b = FadeButton(12)
             b.setObjectName("essential")
             b.setCheckable(True)
-            b.setFixedSize(*((34, 30) if self.horiz else ((38, 38) if self.compact else (46, 40))))
+            b.setFixedSize(*self._ess_tile())
             b.setToolTip(e["title"])
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             icon_path = ICON_DIR / f"{e['host']}.png"
@@ -24863,8 +26935,7 @@ class Browser(QMainWindow):
             b.clicked.connect(lambda _c, e=e: self.open_essential(e))
             b.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             b.customContextMenuRequested.connect(lambda _p, e=e: self.essential_menu(e))
-            pos = (0, n) if self.horiz else ((n, 0) if self.compact else (n // 4, n % 4))
-            self.ess_grid.addWidget(b, *pos)
+            self.ess_grid.addWidget(b, *self._ess_pos(n, cols))
             self.tiles.append((b, e))
         self.ess_grid.setAlignment(Qt.AlignmentFlag.AlignHCenter if self.compact else Qt.AlignmentFlag.AlignLeft)
         self.ess_wrap.setVisible(bool(self.essentials))
@@ -24873,22 +26944,90 @@ class Browser(QMainWindow):
 
     def mark_essentials(self, u=None):
         t = self.cur() if hasattr(self, "stack") else None
-        host = self.host_of(u if u is not None else (t.url() if t else QUrl()))
+        host = getattr(t, "ess", None)
         for b, e in self.tiles:
-            b.setChecked(e["host"] == host)
+            b.setChecked(bool(host) and e["host"] == host)
+
+    def ess_tab(self, host):
+        return next((w for w in self.tab_list() if w.ess == host and not w.closing), None)
 
     def open_essential(self, e):
-        for i in range(self.stack.count()):
-            if self.host_of(self.stack.widget(i).url()) == e["host"]:
-                self.tabs.setCurrentRow(i)
-                break
+        """Switch to the Essential's own tab (making it the first time), landing on the page you left it on."""
+        t = self.ess_tab(e["host"])
+        if t is None:
+            self.new_tab(e.get("last") or e["url"], ess=e["host"])
         else:
-            self.new_tab(e["url"])
+            self.tabs.setCurrentRow(self.stack.indexOf(t))
         self.mark_essentials()
+
+    def go_essential_home(self, e):
+        t = self.ess_tab(e["host"])
+        if t is None:
+            self.new_tab(e["url"], ess=e["host"])
+            return
+        t.pending = None
+        t.load(QUrl(e["url"]))
+        self.tabs.setCurrentRow(self.stack.indexOf(t))
+
+    def leave_essential(self, tab):
+        """Closing an Essential's tab (Ctrl+W, a page closing itself) just moves you on; the Essential stays put."""
+        if self.cur() is tab:
+            i = self.stack.indexOf(tab)
+            regular = [k for k in range(self.stack.count())
+                       if not self.stack.widget(k).ess and not self.stack.widget(k).closing]
+            if regular:
+                after = [k for k in regular if k > i]
+                self.tabs.setCurrentRow(after[0] if after else regular[-1])
+            else:
+                self.new_tab(focus_address=True)
+
+    def pin_essential_tab(self, tab, host):
+        """Turn an open tab into the Essential's own tab: it leaves the tab list and lives in the Essentials grid."""
+        if tab.group:
+            self.remove_from_group(tab)
+        tab.ess = host
+        self.layout_islands()
+        self.fit_tab_width()
+        self.mark_essentials()
+
+    def unpin_essential_tab(self, host):
+        t = self.ess_tab(host)
+        if t is not None:
+            t.ess = None
+            self.layout_islands()
+            self.fit_tab_width()
+
+    def track_essential(self, t):
+        """Remember the last page you were on inside an Essential, so reopening it resumes there."""
+        host = t.ess
+        if not host or PRIVATE or t.closing:
+            return
+        u = t.url()
+        if u.scheme() not in ("http", "https") or self.host_of(u) != host:
+            return
+        s = u.toString()
+        for e in self.essentials:
+            if e["host"] == host:
+                if e.get("last") != s:
+                    e["last"] = s
+                    if not getattr(self, "_ess_save_pending", False):
+                        self._ess_save_pending = True
+                        QTimer.singleShot(1500, self.flush_essentials)
+                break
+
+    def flush_essentials(self):
+        if getattr(self, "_ess_save_pending", False):
+            self._ess_save_pending = False
+            jsave("essentials.json", self.essentials)
 
     def essential_menu(self, e):
         m = QMenu(self)
-        m.addAction("Open in new tab", lambda: self.new_tab(e["url"]))
+        t = self.ess_tab(e["host"])
+        if t is not None:
+            m.addAction("Reload", lambda: (self.wake_tab(t), t.reload()))
+        m.addAction("Back to " + e["host"], lambda: self.go_essential_home(e))
+        m.addAction("Open in new tab", lambda: self.new_tab(e.get("last") or e["url"]))
+        m.addSeparator()
         m.addAction("Remove from Essentials", lambda: self.remove_essential(e["host"]))
         m.exec(QCursor.pos())
 
@@ -24902,12 +27041,16 @@ class Browser(QMainWindow):
             self.toast("Already in Essentials", 2500)
             return
         self.save_icon(host, tab.icon())
-        self.essentials.append({"url": f"{u.scheme()}://{u.host()}/", "title": tab.title() or host, "host": host})
+        self.essentials.append({"url": f"{u.scheme()}://{u.host()}/", "title": tab.title() or host, "host": host,
+                                "last": u.toString()})
         jsave("essentials.json", self.essentials)
+        if self.ess_tab(host) is None:
+            self.pin_essential_tab(tab, host)
         self.rebuild_essentials()
         self.toast("Added to Essentials", 2500)
 
     def remove_essential(self, host):
+        self.unpin_essential_tab(host)
         self.essentials = [e for e in self.essentials if e["host"] != host]
         jsave("essentials.json", self.essentials)
         self.rebuild_essentials()
@@ -25196,6 +27339,8 @@ class Browser(QMainWindow):
             m.addAction("Extensions", self.open_extensions)
             m.addAction("Import from another browser…", self.open_import)
         m.addAction("Downloads\tCtrl+J", self.dlshelf.toggle)
+        if yt_video_url(self.cur().url()):
+            m.addAction("Download this video\u2026", self.show_ytdl_menu)
         m.addAction("Open downloads folder", lambda: QDesktopServices.openUrl(
             QUrl.fromLocalFile(str(Path.home() / "Downloads"))))
         m.addSeparator()
@@ -25325,7 +27470,7 @@ class Browser(QMainWindow):
         """Write the open tabs and every tab group (name, colour, open/shut state, which tabs) to session.json."""
         def url_of(w):
             return w.pending if w.pending is not None else w.url()
-        tabs = [w for w in self.tab_list() if not w.closing and not self.is_internal(url_of(w))]
+        tabs = [w for w in self.tab_list() if not w.closing and not w.ess and not self.is_internal(url_of(w))]
         jsave("session.json", {"tabs": [{"url": url_of(w).toString(), "group": w.group} for w in tabs],
                                "groups": [dict(g) for g in self.groups]})
 
@@ -25344,6 +27489,7 @@ class Browser(QMainWindow):
         f = getattr(self, "_edge_filler", None)
         if f is not None:
             f.hide()
+        self.flush_essentials()
         self.budget_save()
         try:
             self.noise.stop()
