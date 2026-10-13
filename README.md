@@ -18,7 +18,7 @@ pip install PyQt6 PyQt6-WebEngine cryptography
 python fjord.py
 ```
 
-`cryptography` is for the password manager and encrypted chat rooms. For extensions you need PyQt6 6.10 or newer. Without either, Fjord still runs, just without that feature.
+`cryptography` is for the password manager and encrypted chat rooms. For extensions you need PyQt6 6.10 or newer. For the YouTube downloader you need `yt-dlp` (`pip install "yt-dlp[default]"`, or Fjord can install it for you), plus `ffmpeg` for HD video and MP3 and Deno or Node for YouTube itself. Without any of these, Fjord still runs, just without that feature.
 
 You can also pass URLs: `python fjord.py example.com another.com`
 
@@ -29,7 +29,7 @@ The first time you open Fjord it runs a short welcome tour. It covers importing 
 **Tabs**
 - Vertical tabs in a sidebar by default. If you prefer a normal tab bar, switch to horizontal in settings.
 - Tab groups with colours. Drag tabs in and out of them.
-- Essentials: sites you always want a click away, kept at the top of the sidebar.
+- Essentials: sites you always want a click away, kept at the top of the sidebar. Each one is its own tab that stays put, and it remembers the page you left it on, even after a restart. Right-click one to reload it or go back to the site's home page. You can spread them over several rows or columns in settings.
 - Split view, with 2 to 4 tabs side by side.
 - Reopen closed tabs with Ctrl+Shift+T. Your tabs come back when you reopen the browser.
 - Hover over a tab to see a preview of the page. Tabs can also show how much RAM they're using, which helps you find the heavy ones. Both can be switched off in the ⋯ menu.
@@ -45,7 +45,7 @@ Ctrl+Shift+M (or the speech bubble beside the Scratchpad) lets you talk to other
 Chat is local-network only and uses ports 47820 (UDP) and 47821 (TCP), so Windows may ask about the firewall the first time. If nobody shows up, check that both computers are on the same Wi-Fi (guest and school networks often block it), use the same room code, and allow Fjord through the firewall on private networks. Without a room code and `cryptography`, messages aren't encrypted, so don't send anything sensitive that way.
 
 **Picture in picture**
-Click the media player in the sidebar to pop a video out into a small floating window. Drag it anywhere and it glides to the nearest corner, pull a corner to resize it, click to pause, and double-click to send it back to its tab. It can also pop out by itself when you scroll a playing video out of view.
+Click the media player in the sidebar to pop a video out into a small floating window. Drag it anywhere and it glides to the nearest corner, pull a corner to resize it, click to pause, and double-click to send it back to its tab. It can also pop out by itself when you scroll a playing video out of view. With horizontal tabs, the sidebar's media player floats over the page as a small card you can drag to resize. Right-click it to hide it, or turn it off in settings.
 
 **Focus mode**
 Ctrl+Shift+F hides the tabs, sidebar and toolbar so only the page is left. Touch the top edge of the window for a button that brings everything back.
@@ -54,7 +54,7 @@ Ctrl+Shift+F hides the tabs, sidebar and toolbar so only the page is left. Touch
 The shield button shows how many ads and trackers were blocked on the site you're on, lets you switch blocking on or off for that site, and turns your proxy on or off.
 
 **Blocking ads and trackers**
-Fjord has its own filter engine that reads uBlock Origin / EasyList style lists (uBlock filters, EasyList, EasyPrivacy, a malware list and a few others). It's on by default. It handles scriptlets and procedural hiding rules, along with `$important`, `$badfilter` and `$document` filters, blocks known malware pages, and refreshes the lists on its own. You can pause it per site. It isn't uBlock Origin itself, so it won't catch every last thing it does, but it handles most of it, and YouTube gets some extra handling.
+Fjord has its own filter engine that reads uBlock Origin / EasyList style lists (uBlock filters, EasyList, EasyPrivacy, a malware list and a few others). It's on by default. It handles scriptlets, procedural hiding rules, redirects, `google.*`-style rules for every country of a site, and `$important`, `$badfilter` and `$document` filters. It blocks known malware pages and refreshes the lists on its own, falling back to mirror downloads if one fails. While blocking is on, pages can't open pop-up windows by themselves, though windows opened by a click (like sign-in pop-ups) still work. `python fjord.py --adblock-selftest` runs a quick check of the blocker. You can pause it per site. It isn't uBlock Origin itself, so it won't catch every last thing it does, but it handles most of it, and YouTube gets some extra handling.
 
 **Site permissions**
 When a site wants your camera, microphone, location, notifications, clipboard, pointer lock or local fonts, a bar slides in with Block, Allow once and Allow. Block and Allow are remembered per site, and you can change them later in Site settings. Forget them all from ⋯ > Privacy > Reset saved site permissions. Notifications from sites you allow show up as a Fjord toast.
@@ -66,10 +66,10 @@ The sliders button next to the bookmark star (or ⋯ > View & appearance > Site 
 The engine button shows the logo of your current engine. Roll the mouse wheel over it to switch engines (the logo spins to the next one), or click it for the full list. You can add one engine of your own: paste its search address with `%s` where the search words go, like `https://example.com/search?q=%s`.
 
 **History randomiser**
-Off by default. When it's on, Fjord now and then runs one ordinary search or opens one well-known site in an invisible, muted page and adds it to your history, so your real browsing sits among everyday noise. It only uses built-in lists, never follows links or results, never touches your tabs, and keeps no cookies or sign-ins from those visits. You pick how often (light, normal, heavy) and can remove everything it generated in one click. It only changes Fjord's own history. It doesn't hide you from websites or your internet provider, and it isn't anonymity. Not available in private windows. Find it in Settings > Search & privacy.
+Off by default. When it's on, Fjord now and then runs one ordinary search or opens one well-known site in an invisible, muted page and adds it to your history, so your real browsing sits among everyday noise. It only uses built-in lists, never follows links or results, never touches your tabs, and keeps no cookies or sign-ins from those visits. You pick how often (light, normal, heavy, or any number of minutes), whether it searches with Google or your own engine, and whether it visits searches, well-known sites or a mix. A Visit now button lets you try it, and one click removes everything it generated. It only changes Fjord's own history. It doesn't hide you from websites or your internet provider, and it isn't anonymity. Not available in private windows. Find it in Settings > Search & privacy.
 
 **Passwords**
-Fjord can save your logins behind one master password. They're encrypted on your computer and never sent anywhere. After you sign in somewhere new it offers to save the login, and Ctrl+Shift+L fills a saved password for the site you're on. You can add logins by hand, copy or edit them from ⋯ > Passwords, and import a CSV exported from another browser.
+Fjord can save your logins behind one master password. They're encrypted on your computer and never sent anywhere. After you sign in somewhere new it offers to save the login, and Ctrl+Shift+L fills a saved password for the site you're on. When you click into a login field on a site you have a saved password for, a small bar offers to fill it, and if you sign in with a changed password it offers to update the saved one. You can add logins by hand, copy or edit them from ⋯ > Passwords, and import a CSV exported from another browser.
 
 There's no way to recover a forgotten master password, which is what keeps the vault safe. Needs the `cryptography` package.
 
@@ -78,6 +78,9 @@ Ctrl+Shift+N opens a private window. It runs as its own process with a profile t
 
 **Terminal style**
 An optional green-on-black monospace look with near-square corners and a command-prompt new tab. It's on for private windows by default, and you can turn it on for your normal windows too. Both switches are in settings.
+
+**YouTube downloads**
+Open a YouTube video and click the download button next to the bookmark star (or ⋯ > Download this video…). Pick a quality, or audio only as MP3 or the original audio, and it lands on the download shelf with progress and a cancel button. It uses yt-dlp, so you need that installed. For HD video (YouTube keeps picture and sound separate) and MP3 you also need ffmpeg, and for YouTube itself yt-dlp needs a JavaScript runtime (Deno or Node). From source, Fjord can install yt-dlp for you. The packaged exe can't, so put a standalone yt-dlp on your PATH. The popup shows the one-line install commands. Only download videos you have the right to save.
 
 **Downloads**
 Ctrl+J opens a shelf with live progress, speed and time left. You can pause, resume or cancel each download, drag finished files out onto your desktop or into other apps, and right-click for options like Show in folder, Copy SHA-256 or Delete file. Fjord warns about files that look wrong, like a program named `photo.jpg.exe` or an image that's really an error page. It can also sort downloads into folders by type. The warnings come from the file name and its first few bytes. Nothing is uploaded, and it's no replacement for an antivirus.
@@ -106,6 +109,7 @@ Right-click the toolbar and pick Customize. Drag buttons to rearrange them, drag
 - Two sliders for how bright and how transparent the glass surfaces are.
 - New tab page with a custom greeting and a background of your choice: a colour, a gradient, an image, or a video.
 - Pick any accent colour, greys included, plus a font, in settings.
+- The welcome tour opens with an animated slogan and wears whichever interface style you pick.
 - Settings are split into categories (Appearance, Tabs & sidebar, Speed & memory, New tab, Search & privacy, Features, Keyboard & mouse, Extensions, General) with a bar at the top to jump around, and a search box.
 
 **Keyboard and mouse**
@@ -194,6 +198,7 @@ For self-update to work, attach the exe to your GitHub release and make sure its
 - Self-update only works for the Windows exe, or when running `fjord.py` directly.
 - The idle check for site time budgets only works on Windows.
 - The disguised-file check on downloads is a rough guess. It misses things and sometimes flags harmless files.
+- The YouTube downloader depends on yt-dlp, which YouTube breaks from time to time. Updating yt-dlp usually fixes it (the download popup offers Update yt-dlp when something fails).
 - Firefox and Safari extensions are converted on the fly, so a few won't work properly.
 - No sync between devices.
 - Fjord is a hobby project. It's built on Chromium so it gets what QtWebEngine gets, but don't count on it for anything high-stakes.
