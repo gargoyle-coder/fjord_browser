@@ -1,6 +1,5 @@
 # Fjord
 <img width="1919" height="1199" alt="image" src="https://github.com/user-attachments/assets/937484b5-9ef2-420d-b8c9-19c7e22699f9" />
-
 A small, dark browser I built in Python. It runs on PyQt6 and QtWebEngine, so pages are rendered by Chromium, but everything around the page (tabs, sidebar, start page, settings) is my own.
 
 I wanted a browser that stays out of the way, looks calm, and doesn't eat all my RAM. It's one file, `fjord.py`.
@@ -18,7 +17,7 @@ pip install PyQt6 PyQt6-WebEngine cryptography
 python fjord.py
 ```
 
-`cryptography` is for the password manager and encrypted chat rooms. For extensions you need PyQt6 6.10 or newer. For the YouTube downloader you need `yt-dlp` (`pip install "yt-dlp[default]"`, or Fjord can install it for you), plus `ffmpeg` for HD video and MP3 and Deno or Node for YouTube itself. Without any of these, Fjord still runs, just without that feature.
+`cryptography` is for the password manager. For extensions you need PyQt6 6.10 or newer. For the YouTube downloader you need `yt-dlp` (`pip install "yt-dlp[default]"`, or Fjord can install it for you), plus `ffmpeg` for HD video and MP3 and Deno or Node for YouTube itself. Without any of these, Fjord still runs, just without that feature.
 
 You can also pass URLs: `python fjord.py example.com another.com`
 
@@ -29,7 +28,7 @@ The first time you open Fjord it runs a short welcome tour. It covers importing 
 **Tabs**
 - Vertical tabs in a sidebar by default. If you prefer a normal tab bar, switch to horizontal in settings.
 - Tab groups with colours. Drag tabs in and out of them.
-- Essentials: sites you always want a click away, kept at the top of the sidebar. Each one is its own tab that stays put, and it remembers the page you left it on, even after a restart. Right-click one to reload it or go back to the site's home page. You can spread them over several rows or columns in settings.
+- Essentials: sites you always want a click away, kept at the top of the sidebar. Each one is its own tab that stays put, and it remembers the page you left it on, even after a restart. Right-click one to reload it or go back to the site's home page. You can spread them over several rows or columns in settings. Drag a tab onto the Essentials area to pin its site, and each tile is tinted with the colours of the site's icon.
 - Split view, with 2 to 4 tabs side by side.
 - Reopen closed tabs with Ctrl+Shift+T. Your tabs come back when you reopen the browser.
 - Hover over a tab to see a preview of the page. Tabs can also show how much RAM they're using, which helps you find the heavy ones. Both can be switched off in the ⋯ menu.
@@ -39,16 +38,26 @@ The first time you open Fjord it runs a short welcome tour. It covers importing 
 **Command palette**
 Ctrl+K (or the magnifier next to the Scratchpad) opens one box for your open tabs, commands, bookmarks and history. It also takes typed addresses, searches the web, and does quick sums. Start with `>` for commands, `@` for tabs, `*` for bookmarks or `#` for history. Alt+Enter opens a page in the current tab.
 
-**Chat**
-Ctrl+Shift+M (or the speech bubble beside the Scratchpad) lets you talk to other Fjord users on the same network. There's no server. Fjord finds people on your Wi-Fi or LAN by itself, or you can connect by address. You can send messages, reactions, files up to 100 MB, the page you're on, or Scratchpad items, and each chat has a shared pinboard. Set a room code to only see people with the same code. With `cryptography` installed, a room code also encrypts the messages.
-
-Chat is local-network only and uses ports 47820 (UDP) and 47821 (TCP), so Windows may ask about the firewall the first time. If nobody shows up, check that both computers are on the same Wi-Fi (guest and school networks often block it), use the same room code, and allow Fjord through the firewall on private networks. Without a room code and `cryptography`, messages aren't encrypted, so don't send anything sensitive that way.
-
 **Picture in picture**
 Click the media player in the sidebar to pop a video out into a small floating window. Drag it anywhere and it glides to the nearest corner, pull a corner to resize it, click to pause, and double-click to send it back to its tab. It can also pop out by itself when you scroll a playing video out of view. With horizontal tabs, the sidebar's media player floats over the page as a small card you can drag to resize. Right-click it to hide it, or turn it off in settings.
 
 **Focus mode**
 Ctrl+Shift+F hides the tabs, sidebar and toolbar so only the page is left. Touch the top edge of the window for a button that brings everything back.
+
+**Sidebar and toolbar modes**
+Four ways to give the page more room, all in Settings > Tabs & sidebar (they apply live):
+- **Slim sidebar** shrinks the sidebar to a narrow strip of site icons.
+- **Compact mode** moves the menu, back, forward, reload and the address bar into the top of the sidebar, like Zen or Arc, and hides the toolbar. The window buttons slide down when you move the pointer to the top edge. Needs vertical tabs.
+- **Auto-hide** tucks the sidebar away and slides it out over the page when you need it, so the page never resizes.
+- **Focus mode** (see above) hides everything.
+
+You can also choose which of New group, Focus mode, Command palette and Scratchpad show in the sidebar, put each at the top or bottom, and reorder them. Right-click one of those buttons or open the editor from settings.
+
+**Mouse gestures**
+Hold the right mouse button over a page, drag a shape and let go. A trail follows your pointer and a pill at the top shows what it will do. A plain right-click still opens the menu. By default: left and right switch tabs, up and down jump to the top and bottom of the page, down-then-right closes the tab, down-then-left reopens it, up-then-left goes back, up-then-right goes forward, and up-then-down reloads. Change them, add your own or turn them off in Settings > Keyboard & mouse.
+
+**Shift-click preview**
+Hold Shift and click a link to peek at the page in a floating window instead of opening a tab.
 
 **Privacy shield**
 The shield button shows how many ads and trackers were blocked on the site you're on, lets you switch blocking on or off for that site, and turns your proxy on or off.
@@ -69,7 +78,7 @@ The engine button shows the logo of your current engine. Roll the mouse wheel ov
 Off by default. When it's on, Fjord now and then runs one ordinary search or opens one well-known site in an invisible, muted page and adds it to your history, so your real browsing sits among everyday noise. It only uses built-in lists, never follows links or results, never touches your tabs, and keeps no cookies or sign-ins from those visits. You pick how often (light, normal, heavy, or any number of minutes), whether it searches with Google or your own engine, and whether it visits searches, well-known sites or a mix. A Visit now button lets you try it, and one click removes everything it generated. It only changes Fjord's own history. It doesn't hide you from websites or your internet provider, and it isn't anonymity. Not available in private windows. Find it in Settings > Search & privacy.
 
 **Passwords**
-Fjord can save your logins behind one master password. They're encrypted on your computer and never sent anywhere. After you sign in somewhere new it offers to save the login, and Ctrl+Shift+L fills a saved password for the site you're on. When you click into a login field on a site you have a saved password for, a small bar offers to fill it, and if you sign in with a changed password it offers to update the saved one. You can add logins by hand, copy or edit them from ⋯ > Passwords, and import a CSV exported from another browser.
+Fjord can save your logins behind one master password. They're encrypted on your computer and never sent anywhere. After you sign in somewhere new it offers to save the login, and Ctrl+Shift+L fills a saved password for the site you're on. When you click into a login field on a site you have a saved password for, a small bar offers to fill it, and if you sign in with a changed password it offers to update the saved one. Click into an empty password box and Fjord offers to generate a strong 20-character password (no look-alike characters like 0 and O). A window shows the site, username and password for you to check before anything is saved, and the browser behind it blurs. A Passwords page in settings turns the save, fill and generate offers on or off and lists the sites you said never to offer on. You can add logins by hand, copy or edit them from ⋯ > Passwords, and import a CSV exported from another browser.
 
 There's no way to recover a forgotten master password, which is what keeps the vault safe. Needs the `cryptography` package.
 
@@ -91,6 +100,9 @@ Fjord finds Chrome, Edge, Brave, Vivaldi, Chromium, Opera, Opera GX, Arc, Firefo
 **Site time budgets**
 Give a site a daily limit, like 30 minutes for YouTube. Fjord counts the time the site is in front of you, plus any tab playing audio. At the limit it dims the page and pauses media. You can take five more minutes, ignore the limit for today, or close the tab. Counts reset at midnight and stay on your computer. Find it at ⋯ > Privacy > Site time budgets.
 
+**Screen time**
+Fjord can keep a private tally of how long you spend on each site: the page in front of you while you're active, plus any tab playing audio. See today, the last 7 days and your most visited sites at ⋯ > Privacy > Screen time summary, and optionally as a small line on the new tab page. Nothing is recorded in private windows, it never leaves your computer, and you can switch it off or clear it in Settings > Features.
+
 **Extensions**
 Fjord runs Chrome extensions as they are, and converts Firefox add-ons and Safari web extensions when you add them. Click the puzzle piece in the toolbar, then paste a Chrome Web Store or Firefox Add-ons link, or pick a `.crx`, `.xpi`, `.zip` or an unpacked folder. You'll see what the extension can access before it installs.
 
@@ -105,12 +117,12 @@ Right-click the toolbar and pick Customize. Drag buttons to rearrange them, drag
 - Sticky notes: there's a small note button in the bottom right of every site. Notes are saved per site and are still there next time. You can hide the button in settings.
 
 **Looks**
-- Three interface styles: Default, macOS (frosted glass, smooth motion, Mac window buttons) and Windows (a Windows 11 look and Windows buttons). Switch in settings or from the ⋯ menu. Tab groups, prompts and animations follow whichever style you're in.
+- Three interface styles: Default, macOS (frosted glass, smooth motion, Mac window buttons) and Windows (a Windows 11 look and Windows buttons). Switch in settings or from the ⋯ menu. Tab groups, prompts, menus, the file picker and animations follow whichever style you're in.
 - Two sliders for how bright and how transparent the glass surfaces are.
 - New tab page with a custom greeting and a background of your choice: a colour, a gradient, an image, or a video.
-- Pick any accent colour, greys included, plus a font, in settings.
+- Pick any accent colour, greys included, plus a font, in settings. The default font is Palatino Linotype (or the nearest match on your system).
 - The welcome tour opens with an animated slogan and wears whichever interface style you pick.
-- Settings are split into categories (Appearance, Tabs & sidebar, Speed & memory, New tab, Search & privacy, Features, Keyboard & mouse, Extensions, General) with a bar at the top to jump around, and a search box.
+- Settings are split into categories (Appearance, Tabs & sidebar, Speed & memory, New tab, Search & privacy, Passwords, Features, Keyboard & mouse, Extensions, General), each with a short description, a bar at the top to jump around, and a search box.
 
 **Keyboard and mouse**
 Settings > Keyboard & mouse. Click + Add next to any action to record your own shortcut. You can also choose what the middle and side buttons of your mouse do. Side buttons go back and forward unless you change them. One page lists every shortcut.
@@ -121,18 +133,21 @@ Click the speed button to pick one of three modes:
 - **Normal** is the default.
 - **Turbo** never sleeps tabs and uses as much as it likes.
 
+Normal and Turbo also unlock Chromium's 60 fps limit so Fjord follows your monitor's refresh rate (120, 144, 165 Hz and up), with GPU drawing and smooth scrolling. Normal windows keep a cache on disk (64 MB in Eco, 256 MB in Normal, 512 MB in Turbo) so repeat visits load from your drive. Private windows keep theirs in memory.
+
 Changing modes mostly applies right away, but some Chromium flags only take effect after a restart.
 
 **Default browser**
 Set it from the ⋯ menu, settings or the welcome tour. Fjord offers it at launch if it isn't the default yet. Links from other apps open in the window you already have instead of starting a second Fjord. On Windows it opens the Default apps page where you pick Fjord yourself.
 
 **Updates**
-Fjord checks GitHub for a newer release when it starts. You can also check by hand at ⋯ > Check for updates. If there's a new version, it downloads it, checks it and swaps it in, then asks if you want to restart. Turn off the check on launch in the same menu.
+Fjord checks GitHub for a newer release when it starts. You can also check by hand at ⋯ > Check for updates. If there's a new version, it downloads it, checks it and swaps it in, then asks if you want to restart. Turn off the check on launch in the same menu. After an update, Fjord shows the release notes for your version, and you can reopen them any time at ⋯ > Update > What's new.
 
 **Other stuff**
 - Search with Google, DuckDuckGo, Bing or Brave.
 - Bookmarks, history, find in page, zoom, fullscreen, save page as PDF.
 - Proxy support (SOCKS5, HTTP or HTTPS, see the note below).
+- Signing in with Google, Apple, Facebook and similar sites opens a small Fjord window instead of a new tab.
 
 ## Shortcuts
 
@@ -154,7 +169,6 @@ All of these can be changed in Settings > Keyboard & mouse.
 | Ctrl+F | Find in page |
 | Ctrl+B | Toggle sidebar |
 | Ctrl+Shift+S | Scratchpad |
-| Ctrl+Shift+M | Chat |
 | Ctrl+Shift+F | Focus mode |
 | Ctrl+Shift+N | New private window |
 | Ctrl+Shift+L | Fill saved password |
@@ -173,13 +187,13 @@ If your proxy needs a password, that password is saved in plain text in `setting
 
 ## Where your stuff is saved
 
-Everything lives in `~/.fjord_browser/` (so `C:\Users\you\.fjord_browser` on Windows): settings, bookmarks, history, notes, scratchpad items, download history, chat history and received files, site time counts, backgrounds and cached icons. Saved passwords are in there too, as one encrypted file. Delete the folder to reset Fjord completely.
+Everything lives in `~/.fjord_browser/` (so `C:\Users\you\.fjord_browser` on Windows): settings, bookmarks, history, notes, scratchpad items, download history, screen time, site time counts, backgrounds and cached icons. Saved passwords are in there too, as one encrypted file. Delete the folder to reset Fjord completely.
 
 If something goes wrong, Fjord writes it to `crash.log` in that folder. Attach it if you report a bug.
 
 ## Making a Windows exe
 
-Put `fjord.py` and `fjord.ico` in the same folder, then run this in a Command Prompt opened in that folder. Install `cryptography` first so the password manager and encrypted chat get bundled:
+Put `fjord.py` and `fjord.ico` in the same folder, then run this in a Command Prompt opened in that folder. Install `cryptography` first so the password manager gets bundled:
 
 ```
 pip install pyinstaller cryptography
@@ -192,11 +206,10 @@ For self-update to work, attach the exe to your GitHub release and make sure its
 
 ## Known rough edges
 
-- It's a beta. Chat, picture in picture, the command palette and site settings are the newest parts and the most likely to have rough spots.
+- It's a beta. Compact mode, mouse gestures, the screen time summary and the password generator are the newest parts and the most likely to have rough spots.
 - It's built and tested mostly on Windows. Linux and macOS should work but get less attention.
-- Chat only works on a local network, and isn't encrypted without a room code and `cryptography`.
 - Self-update only works for the Windows exe, or when running `fjord.py` directly.
-- The idle check for site time budgets only works on Windows.
+- The idle check for site time budgets and screen time only works on Windows.
 - The disguised-file check on downloads is a rough guess. It misses things and sometimes flags harmless files.
 - The YouTube downloader depends on yt-dlp, which YouTube breaks from time to time. Updating yt-dlp usually fixes it (the download popup offers Update yt-dlp when something fails).
 - Firefox and Safari extensions are converted on the fly, so a few won't work properly.
