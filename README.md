@@ -1,5 +1,6 @@
 # Fjord
-<img width="1919" height="1199" alt="image" src="https://github.com/user-attachments/assets/937484b5-9ef2-420d-b8c9-19c7e22699f9" />
+<img width="1919" height="1199" alt="image" src="https://github.com/user-attachments/assets/64ae7eeb-8ed4-4da2-bce1-5bc54e93f6ce" />
+
 A small, dark browser I built in Python. It runs on PyQt6 and QtWebEngine, so pages are rendered by Chromium, but everything around the page (tabs, sidebar, start page, settings) is my own.
 
 I wanted a browser that stays out of the way, looks calm, and doesn't eat all my RAM. It's one file, `fjord.py`.
@@ -17,7 +18,7 @@ pip install PyQt6 PyQt6-WebEngine cryptography
 python fjord.py
 ```
 
-`cryptography` is for the password manager. For extensions you need PyQt6 6.10 or newer. For the YouTube downloader you need `yt-dlp` (`pip install "yt-dlp[default]"`, or Fjord can install it for you), plus `ffmpeg` for HD video and MP3 and Deno or Node for YouTube itself. Without any of these, Fjord still runs, just without that feature.
+`cryptography` is for the password manager. For extensions you need PyQt6 6.10 or newer. For the YouTube downloader you need `yt-dlp` (`pip install "yt-dlp[default]"`, or Fjord can install it for you), plus `ffmpeg` for HD video and MP3 and Deno or Node for YouTube itself. To play videos Chromium can't (see Fjord Player below) you need `python-vlc` and the VLC app from videolan.org, with the same 32 or 64-bit as Python. To unlock passwords with Touch ID or Windows Hello you need `keyring`, plus `pyobjc-framework-LocalAuthentication` on a Mac, or `winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Security.Credentials.UI` on Windows. Without any of these, Fjord still runs, just without that feature.
 
 You can also pass URLs: `python fjord.py example.com another.com`
 
@@ -28,12 +29,15 @@ The first time you open Fjord it runs a short welcome tour. It covers importing 
 **Tabs**
 - Vertical tabs in a sidebar by default. If you prefer a normal tab bar, switch to horizontal in settings.
 - Tab groups with colours. Drag tabs in and out of them.
-- Essentials: sites you always want a click away, kept at the top of the sidebar. Each one is its own tab that stays put, and it remembers the page you left it on, even after a restart. Right-click one to reload it or go back to the site's home page. You can spread them over several rows or columns in settings. Drag a tab onto the Essentials area to pin its site, and each tile is tinted with the colours of the site's icon.
+- Essentials: sites you always want a click away, kept at the top of the sidebar. Each one is its own tab that stays put, and it remembers the page you left it on, even after a restart. Right-click one to reload it or go back to the site's home page. With vertical tabs you can spread them over several columns in settings. With horizontal tabs they sit behind one small button that opens a popup grid, and you choose how many columns it has. Drag a tile to a new place to reorder them. Drag a tab onto the Essentials area to pin its site, and each tile is tinted with the colours of the site's icon.
 - Split view, with 2 to 4 tabs side by side.
 - Reopen closed tabs with Ctrl+Shift+T. Your tabs come back when you reopen the browser.
 - Hover over a tab to see a preview of the page. Tabs can also show how much RAM they're using, which helps you find the heavy ones. Both can be switched off in the ⋯ menu.
 - Click the little speaker on a playing tab to mute it. Rest the pointer on it and a volume slider slides out.
 - Right-click an empty part of the sidebar to switch between compact and full, turn auto-hide on or off, or reset its width.
+
+**Realms**
+Realms are workspaces. Each has its own tabs and tab groups, so you can keep school, work and fun apart, and your Essentials are shared between all of them. There are up to nine, named after the nine worlds of Norse myth. A row of icons in the sidebar shows them (or a single button if the sidebar is narrow or your tabs are on top). Click one to switch, scroll over the row to step through them, double-click to rename, and drop a tab on an icon to move it there. Right-click for more: pick an icon or type your own symbol, give the realm its own accent colour and new tab background, close it with its tabs, or dissolve it so its tabs move to another realm. Right-click a tab and choose Move to realm. The keys are Ctrl+Alt+Left and Right, Ctrl+Alt+N for a new realm, and Ctrl+Alt+1 to 9 to jump. Tab groups belong to one realm. The command palette lists realms and shows which realm a tab is in.
 
 **Command palette**
 Ctrl+K (or the magnifier next to the Scratchpad) opens one box for your open tabs, commands, bookmarks and history. It also takes typed addresses, searches the web, and does quick sums. Start with `>` for commands, `@` for tabs, `*` for bookmarks or `#` for history. Alt+Enter opens a page in the current tab.
@@ -51,13 +55,16 @@ Four ways to give the page more room, all in Settings > Tabs & sidebar (they app
 - **Auto-hide** tucks the sidebar away and slides it out over the page when you need it, so the page never resizes.
 - **Focus mode** (see above) hides everything.
 
-You can also choose which of New group, Focus mode, Command palette and Scratchpad show in the sidebar, put each at the top or bottom, and reorder them. Right-click one of those buttons or open the editor from settings.
+You can also choose which of New group, Focus mode, Command palette and Scratchpad show in the sidebar, put each at the top or bottom, and reorder them. Right-click one of those buttons or open the editor from settings. With horizontal tabs, all of them sit in one row beside the tabs.
 
 **Mouse gestures**
 Hold the right mouse button over a page, drag a shape and let go. A trail follows your pointer and a pill at the top shows what it will do. A plain right-click still opens the menu. By default: left and right switch tabs, up and down jump to the top and bottom of the page, down-then-right closes the tab, down-then-left reopens it, up-then-left goes back, up-then-right goes forward, and up-then-down reloads. Change them, add your own or turn them off in Settings > Keyboard & mouse.
 
 **Shift-click preview**
 Hold Shift and click a link to peek at the page in a floating window instead of opening a tab.
+
+**Fjord Player**
+The Chromium inside PyQt6-WebEngine has no H.264 decoder, so many sites' videos won't play in it. Hold Shift and click a video and it opens in a floating card that plays the page's stream through VLC instead. Hover for the controls (play, seek, volume, full screen), click to pause, double-click for full screen. You can load a subtitle file and download the stream with yt-dlp. Ctrl+Shift+M plays the current page's video, and Fjord tells you when a page has a stream it can play. YouTube is left to the normal player. Needs `python-vlc` and the VLC app.
 
 **Privacy shield**
 The shield button shows how many ads and trackers were blocked on the site you're on, lets you switch blocking on or off for that site, and turns your proxy on or off.
@@ -78,7 +85,7 @@ The engine button shows the logo of your current engine. Roll the mouse wheel ov
 Off by default. When it's on, Fjord now and then runs one ordinary search or opens one well-known site in an invisible, muted page and adds it to your history, so your real browsing sits among everyday noise. It only uses built-in lists, never follows links or results, never touches your tabs, and keeps no cookies or sign-ins from those visits. You pick how often (light, normal, heavy, or any number of minutes), whether it searches with Google or your own engine, and whether it visits searches, well-known sites or a mix. A Visit now button lets you try it, and one click removes everything it generated. It only changes Fjord's own history. It doesn't hide you from websites or your internet provider, and it isn't anonymity. Not available in private windows. Find it in Settings > Search & privacy.
 
 **Passwords**
-Fjord can save your logins behind one master password. They're encrypted on your computer and never sent anywhere. After you sign in somewhere new it offers to save the login, and Ctrl+Shift+L fills a saved password for the site you're on. When you click into a login field on a site you have a saved password for, a small bar offers to fill it, and if you sign in with a changed password it offers to update the saved one. Click into an empty password box and Fjord offers to generate a strong 20-character password (no look-alike characters like 0 and O). A window shows the site, username and password for you to check before anything is saved, and the browser behind it blurs. A Passwords page in settings turns the save, fill and generate offers on or off and lists the sites you said never to offer on. You can add logins by hand, copy or edit them from ⋯ > Passwords, and import a CSV exported from another browser.
+Fjord can save your logins behind one master password. They're encrypted on your computer and never sent anywhere. After you sign in somewhere new it offers to save the login, and Ctrl+Shift+L fills a saved password for the site you're on. When you click into a login field on a site you have a saved password for, a small bar offers to fill it, and if you sign in with a changed password it offers to update the saved one. Click into an empty password box and Fjord offers to generate a strong 20-character password (no look-alike characters like 0 and O). A window shows the site, username and password for you to check before anything is saved, and the browser behind it blurs. You can unlock your saved passwords with Touch ID or Face ID on a Mac, or Windows Hello on Windows, instead of typing the master password (turn it on from the Passwords page or the welcome tour). The vault key sits in your computer's keychain, and the master password still works. A Passwords page in settings turns the save, fill and generate offers on or off and lists the sites you said never to offer on. You can add logins by hand, copy or edit them from ⋯ > Passwords, and import a CSV exported from another browser.
 
 There's no way to recover a forgotten master password, which is what keeps the vault safe. Needs the `cryptography` package.
 
@@ -101,7 +108,7 @@ Fjord finds Chrome, Edge, Brave, Vivaldi, Chromium, Opera, Opera GX, Arc, Firefo
 Give a site a daily limit, like 30 minutes for YouTube. Fjord counts the time the site is in front of you, plus any tab playing audio. At the limit it dims the page and pauses media. You can take five more minutes, ignore the limit for today, or close the tab. Counts reset at midnight and stay on your computer. Find it at ⋯ > Privacy > Site time budgets.
 
 **Screen time**
-Fjord can keep a private tally of how long you spend on each site: the page in front of you while you're active, plus any tab playing audio. See today, the last 7 days and your most visited sites at ⋯ > Privacy > Screen time summary, and optionally as a small line on the new tab page. Nothing is recorded in private windows, it never leaves your computer, and you can switch it off or clear it in Settings > Features.
+Fjord can keep a private tally of how long you spend on each site: the page in front of you while you're active, plus any tab playing audio. See today, the last 7 days and your most visited sites at ⋯ > Privacy > Screen time summary, and as a card that pops up the first time you open Fjord each day, showing yesterday and the week before (you can switch it off or preview it in settings). Nothing is recorded in private windows, it never leaves your computer, and you can switch it off or clear it in Settings > Features.
 
 **Extensions**
 Fjord runs Chrome extensions as they are, and converts Firefox add-ons and Safari web extensions when you add them. Click the puzzle piece in the toolbar, then paste a Chrome Web Store or Firefox Add-ons link, or pick a `.crx`, `.xpi`, `.zip` or an unpacked folder. You'll see what the extension can access before it installs.
@@ -120,6 +127,7 @@ Right-click the toolbar and pick Customize. Drag buttons to rearrange them, drag
 - Three interface styles: Default, macOS (frosted glass, smooth motion, Mac window buttons) and Windows (a Windows 11 look and Windows buttons). Switch in settings or from the ⋯ menu. Tab groups, prompts, menus, the file picker and animations follow whichever style you're in.
 - Two sliders for how bright and how transparent the glass surfaces are.
 - New tab page with a custom greeting and a background of your choice: a colour, a gradient, an image, or a video.
+- Horizontal tabs are soft pills that stop shrinking at 120 pixels wide.
 - Pick any accent colour, greys included, plus a font, in settings. The default font is Palatino Linotype (or the nearest match on your system).
 - The welcome tour opens with an animated slogan and wears whichever interface style you pick.
 - Settings are split into categories (Appearance, Tabs & sidebar, Speed & memory, New tab, Search & privacy, Passwords, Features, Keyboard & mouse, Extensions, General), each with a short description, a bar at the top to jump around, and a search box.
@@ -170,6 +178,10 @@ All of these can be changed in Settings > Keyboard & mouse.
 | Ctrl+B | Toggle sidebar |
 | Ctrl+Shift+S | Scratchpad |
 | Ctrl+Shift+F | Focus mode |
+| Ctrl+Shift+M | Play the page's video in Fjord Player |
+| Ctrl+Alt+Left / Right | Previous / next realm |
+| Ctrl+Alt+N | New realm |
+| Ctrl+Alt+1 to 9 | Jump to realm |
 | Ctrl+Shift+N | New private window |
 | Ctrl+Shift+L | Fill saved password |
 | Ctrl+P | Save as PDF |
@@ -193,20 +205,21 @@ If something goes wrong, Fjord writes it to `crash.log` in that folder. Attach i
 
 ## Making a Windows exe
 
-Put `fjord.py` and `fjord.ico` in the same folder, then run this in a Command Prompt opened in that folder. Install `cryptography` first so the password manager gets bundled:
+Put `fjord.py` and `fjord.ico` in the same folder, then run this in a Command Prompt opened in that folder. Install `cryptography` first so the password manager gets bundled, and `python-vlc` for Fjord Player:
 
 ```
-pip install pyinstaller cryptography
+pip install pyinstaller cryptography python-vlc
 python -m PyInstaller --noconsole --onefile --icon=fjord.ico --add-data "fjord.ico;." fjord.py
 ```
 
-The exe ends up in `dist\fjord.exe`. If the one-file build is slow to start or won't launch (QtWebEngine can be fussy), use `--onedir` instead of `--onefile`.
+VLC itself isn't bundled, so anyone who wants Fjord Player still needs the VLC app installed. For Windows Hello, install the `keyring` and `winrt` packages from the install section before building too, and test it on the finished exe. The exe ends up in `dist\fjord.exe`. If the one-file build is slow to start or won't launch (QtWebEngine can be fussy), use `--onedir` instead of `--onefile`.
 
 For self-update to work, attach the exe to your GitHub release and make sure its name ends in `.exe`. Bump `APP_VERSION` at the top of `fjord.py` so it matches the release tag. Don't tick "pre-release" on the release, because the updater only looks at the latest full release.
 
 ## Known rough edges
 
-- It's a beta. Compact mode, mouse gestures, the screen time summary and the password generator are the newest parts and the most likely to have rough spots.
+- It's a beta. Realms, Fjord Player, biometric unlock and the Essentials popup are the newest parts and the most likely to have rough spots.
+- Fjord Player and biometric unlock need extra software (VLC, `python-vlc`, `keyring` and a package for your system), and I've only been able to test them on my own computer.
 - It's built and tested mostly on Windows. Linux and macOS should work but get less attention.
 - Self-update only works for the Windows exe, or when running `fjord.py` directly.
 - The idle check for site time budgets and screen time only works on Windows.
